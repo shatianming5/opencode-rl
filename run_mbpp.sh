@@ -7,7 +7,6 @@ export PYTHONUNBUFFERED=1
 export OPENAI_API_KEY="sk-1234"
 export OPENAI_API_BASE="http://10.150.240.117:38888"
 export OPENCODE_MODEL="gpt-5.1-codex"
-export FSM_ENABLED=true
 
 # 自动生成项目专属 opencode config，保持与环境变量一致
 export XDG_CONFIG_HOME="$(pwd)/.opencode-config"
@@ -36,5 +35,4 @@ python main.py \
     --base-model "Qwen/Qwen2.5-0.5B-Instruct" \
     --max-iterations 5 \
     --max-fix-retries 20 \
-    --training-timeout 7200 \
-    --fsm-enabled
+    --training-timeout 7200

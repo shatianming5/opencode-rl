@@ -2,7 +2,7 @@ from .env_setup import EnvHandle, RolloutCallResult, EvaluationCallResult, Deplo
 from .env_execution import (
     rollout, evaluate, rollout_and_evaluate,
     deploy, deploy_teardown,
-    with_env_vars, with_runtime_env_path,
+    with_runtime_env_path,
 )
 from .pipeline_spec import PipelineSpec, load_pipeline_spec
 from .pipeline_verify import run_pipeline_verification
@@ -18,7 +18,7 @@ from .stage_cache import (
 __all__ = [
     "EnvHandle", "RolloutCallResult", "EvaluationCallResult", "DeployCallResult",
     "open_env", "rollout", "evaluate", "rollout_and_evaluate",
-    "deploy", "deploy_teardown", "with_env_vars", "with_runtime_env_path",
+    "deploy", "deploy_teardown", "with_runtime_env_path",
     "PipelineSpec", "load_pipeline_spec", "run_pipeline_verification", "run_bootstrap",
     "StageCache", "load_stage_cache", "save_stage_cache",
     "invalidate_stage_cache", "invalidate_all_caches",

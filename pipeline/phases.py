@@ -164,6 +164,7 @@ def phase_fix_training(
     error_log_path: str,
     data_path: str,
     workspace: str,
+    iteration: int = 0,
     opencode_model: str = "",
     opencode_url: str = "",
     max_agent_steps: int = 30,
@@ -176,7 +177,7 @@ def phase_fix_training(
     log_dir = repo_root / "code" / "agent_logs"
     log_dir.mkdir(parents=True, exist_ok=True)
 
-    fix_prompt = build_fix_prompt(code_path, error_log_path, data_path, workspace)
+    fix_prompt = build_fix_prompt(code_path, error_log_path, data_path)
     print(f"  Prompt: {len(fix_prompt)} chars, model: {model}, starting server...", flush=True)
 
     agent = OpenCodeClient(
@@ -190,20 +191,20 @@ def phase_fix_training(
         scaffold_bash_mode="full",
         unattended="strict",
         max_turns=max_agent_steps,
-        server_log_path=log_dir / "opencode_fix.log",
-        session_title="fix_training",
+        server_log_path=log_dir / f"opencode_fix_iter{iteration}.log",
+        session_title=f"fix_training_iter{iteration}",
     )
 
     try:
         result = agent.run(
             fix_prompt,
             fsm_state="S0_FIX",
-            iter_idx=0,
+            iter_idx=iteration,
             purpose="fix_training",
             on_turn=make_stream_printer("FixTraining"),
         )
         if result.assistant_text:
-            (log_dir / "fix_result.txt").write_text(
+            (log_dir / f"fix_iter{iteration}_result.txt").write_text(
                 result.assistant_text[-20000:], encoding="utf-8",
             )
     finally:
@@ -220,7 +221,6 @@ def phase_analysis(
     training_log_path: str,
     score: float | None = None,
     samples_path: str = "",
-    task_description: str = "",
     opencode_model: str = "",
     opencode_url: str = "",
     max_agent_steps: int = 30,
@@ -244,7 +244,7 @@ def phase_analysis(
 
     prompt = build_analysis_prompt(
         iteration, workspace, code_path, training_log_path,
-        score, samples_path, task_description,
+        score, samples_path,
     )
     print(f"  Prompt: {len(prompt)} chars, model: {model}, starting server...", flush=True)
 

@@ -1,9 +1,38 @@
-"""Pipeline 工具函数：数据统计、GPU 信息、数据预览、模型解析。"""
+"""Pipeline 工具函数：数据统计、GPU 信息、采样计数、模型解析。"""
 
 import json
 import os
 import subprocess
 from pathlib import Path
+
+
+def count_samples_jsonl(samples_path: str) -> tuple[int, int]:
+    """读取 samples.jsonl，返回 (total, pass_count)。
+
+    pass_count = reward >= 1.0 的样本数。
+    全项目统一使用此函数做采样计数，避免重复实现。
+    """
+    p = Path(samples_path)
+    if not p.exists():
+        return 0, 0
+    total = 0
+    passed = 0
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                total += 1
+                try:
+                    r = json.loads(line).get("reward", 0)
+                    if float(r) >= 1.0:
+                        passed += 1
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return total, passed
 
 
 def resolve_model_path(model_name: str) -> str:

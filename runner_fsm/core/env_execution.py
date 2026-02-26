@@ -270,10 +270,6 @@ def rollout_and_evaluate(
     )
 
 
-def with_env_vars(extra_env: dict[str, str]) -> dict[str, str]:
-    return _merge_env({}, extra_env)
-
-
 def with_runtime_env_path(runtime_env_path: str | Path) -> dict[str, str]:
     p = Path(str(runtime_env_path)).expanduser().resolve()
     return _merge_env({}, {"OPENCODE_RUNTIME_ENV_PATH": str(p)})

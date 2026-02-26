@@ -28,7 +28,7 @@ pip install -r requirements.txt
 python main.py --list-benchmarks
 ```
 
-### 基础 Pipeline（不启用 FSM）
+### 运行 Pipeline
 
 ```bash
 export OPENAI_API_KEY="sk-1234"
@@ -38,13 +38,12 @@ export OPENCODE_MODEL="gpt-5.1-codex"
 python main.py --benchmark mbpp --base-model Qwen/Qwen2.5-0.5B-Instruct
 ```
 
-### 启用 FSM Deploy + Rollout + Evaluate
+FSM Deploy + Rollout + Evaluate 始终启用，可通过参数调整引擎和模式：
 
 ```bash
 python main.py \
     --benchmark mbpp \
     --base-model Qwen/Qwen2.5-0.5B-Instruct \
-    --fsm-enabled \
     --fsm-deploy-engine local \
     --fsm-mode smoke
 ```
@@ -136,7 +135,8 @@ python3 export_to_ui.py --run-dir runs/mbpp_20260226_153910
 | `OPENCODE_URL` | OpenCode server 地址（可选，留空自动启动本地 server） |
 | `XDG_CONFIG_HOME` | 项目专属 OpenCode 配置目录（运行脚本自动设置） |
 | `CUDA_VISIBLE_DEVICES` | GPU 选择 |
-| `FSM_ENABLED` | 是否启用 FSM（`1`/`true`） |
+| `FSM_DEPLOY_ENGINE` | 部署引擎（`vllm`/`tgi`/`local`，默认 `vllm`） |
+| `FSM_MODE` | 执行模式（`smoke`/`full`，默认 `smoke`） |
 
 ### FSM 高级配置
 
@@ -289,12 +289,11 @@ flowchart TD
 python main.py \
     --benchmark {name}              # benchmark 名称
     --base-model {model}            # 基础模型（HF 或本地路径）
-    --max-iterations {n}            # 最大迭代次数（默认 1）
-    --max-fix-retries {n}           # 训练失败最大修复次数（默认 10）
+    --max-iterations {n}            # 最大迭代次数（默认 5）
+    --max-fix-retries {n}           # 训练失败最大修复次数（默认 20）
     --training-timeout {seconds}    # 训练超时秒数（默认 3600）
-    --fsm-enabled                   # 启用 FSM deploy/rollout/evaluate
-    --fsm-deploy-engine {engine}    # 部署引擎：vllm/tgi/local
-    --fsm-mode {mode}               # 执行模式：smoke/full
+    --fsm-deploy-engine {engine}    # 部署引擎：vllm/tgi/local（默认 vllm）
+    --fsm-mode {mode}               # 执行模式：smoke/full（默认 smoke）
     --run-dir {path}                # 自定义输出目录
     --list-benchmarks               # 列出可用 benchmark
 ```

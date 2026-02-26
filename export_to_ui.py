@@ -23,7 +23,7 @@ RUNS_DIR = Path(__file__).resolve().parent / "runs"
 
 COLUMNS = [
     "run_id", "timestamp", "task", "agent", "driver_model", "base_model",
-    "baseline", "best_score", "improvement", "submissions",
+    "baseline", "best_score", "submissions",
     "duration_s", "success", "workspace",
 ]
 
@@ -68,7 +68,6 @@ def parse_run_dir(run_path: Path) -> dict | None:
         "base_model": data.get("base_model", ""),
         "baseline": 0.0,
         "best_score": best_score if best_score is not None else "",
-        "improvement": best_score if best_score is not None else "",
         "submissions": submissions,
         "duration_s": int(data.get("total_time", 0)),
         "success": success,

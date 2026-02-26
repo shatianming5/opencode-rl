@@ -102,7 +102,6 @@ def build_fix_prompt(
     code_path: str,
     error_log_path: str,
     data_path: str,
-    workspace: str,
 ) -> str:
     """构造训练失败后的修复 prompt — 探索式，让 agent 自主读日志和代码诊断。"""
 
@@ -131,7 +130,6 @@ def build_analysis_prompt(
     training_log_path: str,
     score: float | None,
     samples_path: str = "",
-    task_description: str = "",
 ) -> str:
     """构建自分析 prompt — 探索式，让 agent 自主查阅所有资料写诊断报告。"""
 
