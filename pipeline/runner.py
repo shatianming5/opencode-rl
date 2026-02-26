@@ -191,6 +191,82 @@ class _FSMProgressMonitor:
         self.stop()
 
 
+def _create_fsm_session(fsm_config: dict):
+    """创建 FSM EnvSession。"""
+    try:
+        from runner_fsm.env import setup
+    except ImportError:
+        from runner.env import setup
+
+    session = setup(
+        target=fsm_config.get("target_repo", "."),
+        require_metrics=True,
+        audit="warn-only",
+        use_cache=fsm_config.get("cache_enabled", True),
+        opencode_model=fsm_config.get("opencode_model", ""),
+        opencode_url=fsm_config.get("opencode_url", ""),
+        unattended="strict",
+        strict_opencode=True,
+        opencode_timeout_seconds=600,
+    )
+    session.command_hints = []
+    session.hint_anchors = []
+    return session
+
+
+def _build_fsm_env_overrides(
+    model_path: str,
+    deploy_engine: str,
+    data_path: str = "",
+    output_dir: str = "",
+) -> dict[str, str]:
+    """构建传递给 FSM stage 脚本的环境变量。"""
+    overrides: dict[str, str] = {"TRAINED_MODEL_PATH": str(model_path), "DEPLOY_ENGINE": deploy_engine}
+    if data_path:
+        overrides["DATA_PATH"] = data_path
+    if output_dir:
+        overrides["OUTPUT_DIR"] = output_dir
+    for key in ("OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_API_BASE",
+                 "MODEL_PATH", "CUDA_VISIBLE_DEVICES"):
+        val = os.environ.get(key, "")
+        if val:
+            overrides[key] = val
+    if "DATA_PATH" not in overrides:
+        val = os.environ.get("DATA_PATH", "")
+        if val:
+            overrides["DATA_PATH"] = val
+    if "OUTPUT_DIR" not in overrides:
+        val = os.environ.get("OUTPUT_DIR", "")
+        if val:
+            overrides["OUTPUT_DIR"] = val
+    return overrides
+
+
+def _extract_samples_path(rollout_path, target_repo: str) -> str | None:
+    """从 rollout.json 中提取 samples.jsonl 路径。"""
+    if rollout_path is None:
+        return None
+    try:
+        with open(rollout_path, "r", encoding="utf-8") as f:
+            obj = json.load(f)
+    except Exception:
+        return None
+    if not isinstance(obj, dict):
+        return None
+    paths = obj.get("paths")
+    if isinstance(paths, dict):
+        raw = paths.get("samples_jsonl")
+        if isinstance(raw, str) and raw.strip():
+            p = Path(raw.strip())
+            if p.exists():
+                return str(p)
+            repo = Path(target_repo).resolve()
+            candidate = (repo / p).resolve()
+            if candidate.exists():
+                return str(candidate)
+    return None
+
+
 def _try_fsm_deploy_and_rollout(
     workspace: str,
     model_path: str,
@@ -206,24 +282,21 @@ def _try_fsm_deploy_and_rollout(
         return None
 
     try:
-        from fsm_bridge import FSMBridge
+        session = _create_fsm_session(fsm_config)
     except ImportError:
-        print("  FSM bridge not available, skipping FSM rollout")
+        print("  FSM runner not available, skipping FSM rollout")
         return None
 
     print(f"\n{'='*60}")
     print(f"  Phase FSM: Deploy + Rollout")
     print(f"{'='*60}")
 
-    bridge = FSMBridge(
-        target_repo=fsm_config.get("target_repo", "."),
-        deploy_engine=fsm_config.get("deploy_engine", "vllm"),
-        repair_iters=fsm_config.get("repair_iters", 3),
-        opencode_url=fsm_config.get("opencode_url", ""),
-        opencode_model=fsm_config.get("opencode_model", ""),
-        audit="warn-only",
-        data_path=data_path,
-        output_dir=output_dir,
+    model_dir = Path(model_path).resolve()
+    if not model_dir.exists():
+        return {"ok": False, "reason": f"model_path_not_found: {model_dir}"}
+
+    env_overrides = _build_fsm_env_overrides(
+        model_path, fsm_config.get("deploy_engine", "vllm"), data_path, output_dir,
     )
 
     # 获取数据总量用于进度显示
@@ -235,24 +308,34 @@ def _try_fsm_deploy_and_rollout(
             with open(p, "r") as f:
                 total_samples = sum(1 for _ in f)
 
+    target_repo = fsm_config.get("target_repo", ".")
     try:
-        target_repo = fsm_config.get("target_repo", ".")
         with _FSMProgressMonitor("FSM Rollout", target_repo, total_samples):
-            result = bridge.deploy_and_rollout(
-                model_path=model_path,
+            rollout_result = session.rollout(
+                llm=model_dir,
                 mode=fsm_config.get("mode", "smoke"),
                 require_samples=True,
+                env_overrides=env_overrides,
+                repair_iters=fsm_config.get("repair_iters", 3),
             )
-        if result and result.get("ok"):
-            print(f"  FSM rollout OK: samples={result.get('samples_path')}")
-            return result
-        else:
-            reason = result.get("reason", "unknown") if result else "bridge returned None"
-            print(f"  FSM rollout failed: {reason}")
-            return result
     except Exception as e:
         print(f"  FSM rollout error: {e}")
-        return None
+        return {"ok": False, "reason": f"rollout_exception: {e}"}
+
+    if not rollout_result.ok:
+        verify = rollout_result.verify
+        failed = getattr(verify, "failed_stage", "unknown") if verify else "unknown"
+        print(f"  FSM rollout failed: stage={failed}")
+        return {"ok": False, "reason": f"rollout_failed: stage={failed}"}
+
+    samples_path = _extract_samples_path(rollout_result.rollout_path, target_repo)
+    print(f"  FSM rollout OK: samples={samples_path}")
+    return {
+        "ok": True,
+        "samples_path": samples_path or "",
+        "rollout_path": str(rollout_result.rollout_path or ""),
+        "artifacts_dir": str(rollout_result.artifacts_dir),
+    }
 
 
 def _compute_score_from_samples(samples_path: str) -> dict | None:
@@ -331,7 +414,7 @@ def _try_fsm_evaluate(
         return None
 
     try:
-        from fsm_bridge import FSMBridge
+        session = _create_fsm_session(fsm_config)
     except ImportError:
         return None
 
@@ -339,36 +422,48 @@ def _try_fsm_evaluate(
     print(f"  Phase FSM: Evaluate")
     print(f"{'='*60}")
 
-    bridge = FSMBridge(
-        target_repo=fsm_config.get("target_repo", "."),
-        deploy_engine=fsm_config.get("deploy_engine", "vllm"),
-        repair_iters=fsm_config.get("repair_iters", 3),
-        opencode_url=fsm_config.get("opencode_url", ""),
-        opencode_model=fsm_config.get("opencode_model", ""),
-        audit="warn-only",
-        data_path=data_path,
-        output_dir=output_dir,
-    )
+    env_overrides = {}
+    if model_path:
+        env_overrides = _build_fsm_env_overrides(
+            model_path, fsm_config.get("deploy_engine", "vllm"), data_path, output_dir,
+        )
 
+    target_repo = fsm_config.get("target_repo", ".")
+    llm_arg = Path(model_path) if model_path else None
     try:
-        target_repo = fsm_config.get("target_repo", ".")
         with _FSMProgressMonitor("FSM Evaluate", target_repo, is_evaluate=True):
-            result = bridge.evaluate(model_path=model_path, mode=fsm_config.get("mode", "smoke"))
-        if result and result.get("ok"):
-            print(f"  FSM evaluate OK: score={result.get('score')}")
-            return result
-        else:
-            reason = result.get("reason", "unknown") if result else "bridge returned None"
-            print(f"  FSM evaluate failed: {reason}")
-            # Fallback: 直接读 metrics.json（eval_audit 误判时仍可拿到真实分数）
-            fallback = _read_fsm_metrics(fsm_config.get("target_repo", "."))
-            if fallback:
-                print(f"  FSM fallback OK: score={fallback['score']}")
-                return fallback
-            return result
+            eval_result = session.evaluate(
+                llm=llm_arg,
+                mode=fsm_config.get("mode", "smoke"),
+                env_overrides=env_overrides or None,
+                repair_iters=fsm_config.get("repair_iters", 3),
+            )
     except Exception as e:
         print(f"  FSM evaluate error: {e}")
         return None
+
+    if not eval_result.ok:
+        verify = eval_result.verify
+        failed = getattr(verify, "failed_stage", "unknown") if verify else "unknown"
+        print(f"  FSM evaluate failed: stage={failed}")
+        # Fallback: 直接读 metrics.json（eval_audit 误判时仍可拿到真实分数）
+        fallback = _read_fsm_metrics(target_repo)
+        if fallback:
+            print(f"  FSM fallback OK: score={fallback['score']}")
+            return fallback
+        return {"ok": False, "reason": f"evaluate_failed: stage={failed}"}
+
+    metrics = eval_result.metrics or {}
+    score = metrics.get("score")
+    print(f"  FSM evaluate OK: score={score}")
+    return {
+        "ok": True,
+        "score": score,
+        "improvement": metrics.get("improvement"),
+        "best_score": metrics.get("best_score"),
+        "metrics": metrics,
+        "metrics_path": str(eval_result.metrics_path or ""),
+    }
 
 
 def _scaffold_fsm_evaluation(

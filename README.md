@@ -156,7 +156,6 @@ python3 export_to_ui.py --run-dir runs/mbpp_20260226_153910
 ```
 opencode-rl/
 ├── main.py                     # 主入口
-├── fsm_bridge.py               # FSM-Runner 桥接层
 ├── export_to_ui.py             # 结果导出到 RD-Agent UI
 ├── pipeline.yml                # FSM 合同定义
 ├── requirements.txt
