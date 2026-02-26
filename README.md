@@ -239,28 +239,37 @@ opencode-rl/
 
 ## Pipeline 执行流程
 
-```
-main.py
-  │
-  ▼
-┌─────────────────────────────────────────────────────────┐
-│  迭代循环 (max_iterations)                                │
-│                                                          │
-│  ┌──────────┐    ┌──────────┐    ┌──────────┐           │
-│  │ 代码生成  │───▶│ 训练执行  │───▶│ 错误修复  │ (重试)    │
-│  │ OpenCode │    │ train.py │    │ OpenCode │           │
-│  └──────────┘    └──────────┘    └──────────┘           │
-│       │                                                  │
-│       ▼ (FSM 启用时)                                      │
-│  ┌─────────┐    ┌──────────┐    ┌──────────┐    ┌──────┐│
-│  │  deploy  │───▶│ rollout  │───▶│ evaluate │───▶│ 分析 ││
-│  │  setup   │    │ 生成样本  │    │ 计算指标  │    │      ││
-│  │  health  │    │          │    │          │    │      ││
-│  └─────────┘    └──────────┘    └──────────┘    └──────┘│
-│       │                              │                   │
-│    缓存写入                       metrics.json            │
-│    (.opencode_fsm/cache/)       {ok, score, accuracy}    │
-└─────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    Start([main.py]) --> Loop
+
+    subgraph Loop ["迭代循环 (max_iterations)"]
+        direction TB
+        A["1. 代码生成\n(OpenCode LLM)"] --> B["2. 训练执行\n(train.py)"]
+        B --> C{训练成功?}
+        C -- 失败 --> D["3. 错误修复\n(OpenCode LLM)"]
+        D --> B
+        C -- 成功 --> E{FSM 启用?}
+        E -- 否 --> J
+        E -- 是 --> F
+
+        subgraph FSM ["FSM Deploy / Rollout / Evaluate"]
+            F["4. Deploy\nsetup + health check"] --> G["5. Rollout\n生成训练样本"]
+            G --> H["6. Evaluate\n计算 metrics.json"]
+        end
+
+        H --> I{score > 0?}
+        I -- 否 --> R["自动修复 rollout\n(OpenCode LLM)"]
+        R --> G
+        I -- 是 --> J["7. 分析总结\n(OpenCode LLM)"]
+    end
+
+    J --> K{还有迭代?}
+    K -- 是 --> A
+    K -- 否 --> End([pipeline_results.json])
+
+    style FSM fill:#f0f4ff,stroke:#4a6fa5
+    style Loop fill:#fafafa,stroke:#999
 ```
 
 ## 新增 Benchmark
