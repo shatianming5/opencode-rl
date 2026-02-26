@@ -70,9 +70,3 @@ def get_benchmark(name: str) -> BenchmarkInfo:
 def list_benchmarks() -> list[str]:
     """返回所有已注册 benchmark 名称（排序）。"""
     return sorted(discover_benchmarks().keys())
-
-
-def reset_cache() -> None:
-    """清除缓存，下次 discover 重新扫描。"""
-    global _cache
-    _cache = None

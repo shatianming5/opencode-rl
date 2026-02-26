@@ -15,7 +15,10 @@ import re
 from datetime import datetime
 from pathlib import Path
 
-RESULTS_CSV = Path("/data/userdata/v-tiansha/RD-Agent/rdagent/scenarios/rl/autorl_bench/results.csv")
+RESULTS_CSV = Path(os.environ.get(
+    "RESULTS_CSV_PATH",
+    os.path.expanduser("~/RD-Agent/rdagent/scenarios/rl/autorl_bench/results.csv"),
+))
 RUNS_DIR = Path(__file__).resolve().parent / "runs"
 
 COLUMNS = [

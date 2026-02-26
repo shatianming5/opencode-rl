@@ -2,7 +2,6 @@
 
 import json
 import os
-import re
 import subprocess
 from pathlib import Path
 
@@ -21,7 +20,6 @@ def resolve_model_path(model_name: str) -> str:
 
     try:
         from huggingface_hub import snapshot_download, try_to_load_from_cache
-        from huggingface_hub.utils import LocalEntryNotFoundError
     except ImportError:
         print(f"  huggingface_hub not installed, using model name as-is: {model_name}")
         return model_name
@@ -82,28 +80,6 @@ def get_data_stats(data_path: str) -> dict:
         "avg_prompt_len": sum(prompt_lens) // max(len(prompt_lens), 1),
         "avg_answer_len": sum(answer_lens) // max(len(answer_lens), 1),
     }
-
-
-def load_data_preview(data_path: str, num_samples: int = 3) -> str:
-    """返回 train.jsonl 前几条样本的 JSON 预览。"""
-    path = Path(data_path)
-    jsonl = path / "train.jsonl" if path.is_dir() else path
-
-    if not jsonl.exists():
-        return "（数据文件不存在）"
-
-    records = []
-    try:
-        with open(jsonl, "r", encoding="utf-8") as f:
-            for i, line in enumerate(f):
-                if i >= num_samples:
-                    break
-                if line.strip():
-                    records.append(json.loads(line))
-    except Exception as e:
-        return f"（读取失败: {e}）"
-
-    return json.dumps(records, ensure_ascii=False, indent=2)
 
 
 def get_gpu_info() -> dict:

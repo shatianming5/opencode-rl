@@ -12,7 +12,6 @@ class IterationResult:
     training_time: float = 0.0
     score: float | None = None
     improvement: float | None = None
-    best_score: float | None = None
     model_path: str = ""
     code_path: str = ""
     samples_path: str = ""
