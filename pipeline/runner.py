@@ -534,7 +534,7 @@ def _scaffold_fsm_evaluation(
         print("  WARNING: rollout.sh still contains skeleton placeholder")
         return False
     if "reward" not in content.lower():
-        print("  WARNING: rollout.sh missing reward logic after scaffold")
+        print("  WARNING: rollout.sh missing eval reward logic after scaffold")
         return False
     print(f"  Scaffold verification OK: rollout.sh rewritten ({len(content)} bytes)")
     return True
@@ -551,7 +551,7 @@ def _repair_rollout_zero_reward(
     repair_attempt: int,
     max_attempts: int,
 ) -> bool:
-    """调用 OpenCode 自主诊断并修复 rollout.sh 中的 reward 计算逻辑。"""
+    """调用 OpenCode 自主诊断并修复 rollout.sh 中的评测 reward 逻辑。"""
     print(f"\n{'='*60}")
     print(f"  Rollout Repair: attempt {repair_attempt}/{max_attempts}")
     print(f"{'='*60}")
@@ -758,8 +758,8 @@ def run_pipeline(
                     if pass_count > 0 or rollout_attempt >= max_rollout_repair_retries:
                         break
 
-                    # 全零 reward → 调用 OpenCode 自主修复
-                    print(f"\n  All {total} samples got reward=0.0, attempting auto-repair...")
+                    # 评测通过率为零 → 调用 OpenCode 自主修复评测逻辑
+                    print(f"\n  All {total} samples got eval reward=0.0, attempting auto-repair...")
                     repair_ok = _repair_rollout_zero_reward(
                         workspace=workspace,
                         fsm_config=fsm_config,

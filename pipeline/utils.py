@@ -146,7 +146,7 @@ def get_rollout_samples_stats(samples_path: str) -> dict | None:
         return None
 
     total = 0
-    rewards = []
+    eval_scores = []
     prompt_lens = []
     completion_lens = []
     try:
@@ -163,7 +163,7 @@ def get_rollout_samples_stats(samples_path: str) -> dict | None:
                 total += 1
                 r = item.get("reward")
                 if isinstance(r, (int, float)):
-                    rewards.append(float(r))
+                    eval_scores.append(float(r))
                 pr = item.get("prompt", "")
                 co = item.get("completion", "")
                 if isinstance(pr, str):
@@ -176,16 +176,16 @@ def get_rollout_samples_stats(samples_path: str) -> dict | None:
     if total == 0:
         return None
 
-    avg_reward = sum(rewards) / len(rewards) if rewards else 0.0
+    avg_score = sum(eval_scores) / len(eval_scores) if eval_scores else 0.0
     avg_prompt = sum(prompt_lens) // max(len(prompt_lens), 1)
     avg_completion = sum(completion_lens) // max(len(completion_lens), 1)
 
     return {
         "total_samples": total,
-        "avg_reward": round(avg_reward, 4),
+        "avg_eval_score": round(avg_score, 4),
         "avg_prompt_len": avg_prompt,
         "avg_completion_len": avg_completion,
-        "reward_positive_ratio": round(
-            sum(1 for r in rewards if r > 0) / max(len(rewards), 1), 4
+        "pass_rate": round(
+            sum(1 for r in eval_scores if r >= 1.0) / max(len(eval_scores), 1), 4
         ),
     }

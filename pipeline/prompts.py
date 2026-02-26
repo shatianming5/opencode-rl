@@ -50,8 +50,8 @@ def build_code_prompt(
             if stats:
                 history_section += f"\n## 上一轮 Rollout 统计\n"
                 history_section += f"- 样本数：{stats['total_samples']}\n"
-                history_section += f"- 平均 reward：{stats['avg_reward']}\n"
-                history_section += f"- reward>0 比例：{stats['reward_positive_ratio']}\n"
+                history_section += f"- 平均评测得分：{stats['avg_eval_score']}\n"
+                history_section += f"- 评测通过率：{stats['pass_rate']}\n"
                 history_section += f"- 平均 completion 长度：{stats['avg_completion_len']} 字符\n"
                 history_section += f"- Rollout 样本文件：{last.samples_path}（可用 head 查看具体样本）\n"
 
@@ -75,7 +75,7 @@ def build_code_prompt(
 
 ## 你的任务
 1. 先探索：用 terminal 查看数据格式、读 description.md、了解任务要求
-2. 再设计：选择训练方法、设计 reward 函数、确定超参数
+2. 再设计：选择训练方法、设计训练 reward 函数、确定超参数
 3. 最后写代码：生成 {workspace}/code/train.py
 
 ## 输出合约
@@ -142,7 +142,7 @@ def build_analysis_prompt(
 - 任务描述：{workspace}/description.md
 - 训练代码：{code_path}
 - 训练日志：{training_log_path}
-- Rollout 样本：{samples_path or "（无）"}（JSONL，每行有 prompt/completion/reward 字段）
+- Rollout 样本：{samples_path or "（无）"}（JSONL，每行有 prompt/completion/reward 字段，reward 为评测通过=1.0/失败=0.0）
 
 ## 你的任务
 分析训练过程：读代码、日志、rollout 样本。理解发生了什么、为什么。
@@ -152,7 +152,7 @@ def build_analysis_prompt(
 - 性能问题的根因
 - 下一轮的具体改进建议（最多3条，按优先级排序）
 
-用日志和样本中的具体数据支撑你的分析（引用 reward 值、loss 趋势、具体样本等）。
+用日志和样本中的具体数据支撑你的分析（引用评测通过率、loss 趋势、具体样本等）。
 
 完成后调用 finish 工具结束。
 """
@@ -195,8 +195,10 @@ cat .opencode_fsm/stages/evaluation.sh
 
 ## 重要：骨架脚本说明
 
-当前 `rollout.sh` 是一个**通用骨架**，reward 全部写 0.0（占位符）。你**必须**替换为真正的评测逻辑。
-当前 `evaluation.sh` 已经是通用的（读 samples.jsonl → 算 reward>=1.0 比例 → 写 metrics.json），通常不需要修改，除非 reward 的含义与 pass/fail 不同。
+当前 `rollout.sh` 是一个**通用骨架**，评测 reward 全部写 0.0（占位符）。你**必须**替换为真正的评测逻辑。
+当前 `evaluation.sh` 已经是通用的（读 samples.jsonl → 算评测 reward>=1.0 比例 → 写 metrics.json），通常不需要修改。
+
+> **注意**：这里的 reward 是**评测通过/不通过**（1.0=通过, 0.0=不通过），与 train.py 中 GRPOTrainer 的训练 reward 是不同阶段的概念。训练 reward 用于 RL 梯度更新，评测 reward 用于衡量最终模型质量。
 
 ## 第三步：重写 rollout.sh
 
@@ -212,7 +214,7 @@ cat .opencode_fsm/stages/evaluation.sh
 | 约束 | 要求 |
 |------|------|
 | 评测范围 | **全量 {sample_count} 条**，禁止截断（不能有 EVAL_LIMIT=5） |
-| reward 真实性 | 必须用 exec() 执行真实测试用例，禁止字符串匹配或"非空=1" |
+| 评测 reward 真实性 | 必须用 exec() 执行真实测试用例，禁止字符串匹配或"非空=1" |
 | 超时保护 | 每条样本测试执行最多 **5 秒**（用 multiprocessing.Pool + timeout） |
 | GPU 推理 | torch.bfloat16 + device_map="auto"，禁止 CPU float32 |
 | Chat 模板 | 训练用 chat prompt，推理也要用 tokenizer.apply_chat_template |
@@ -222,7 +224,7 @@ cat .opencode_fsm/stages/evaluation.sh
 ## 第四步：重写 evaluation.sh
 
 - 读 `.opencode_fsm/rollout.json` → 找 samples.jsonl
-- 算 pass@1 = (reward >= 1.0 的样本数) / 总数
+- 算 pass@1 = (评测 reward >= 1.0 的样本数) / 总数
 - 写 `.opencode_fsm/metrics.json`：`{{"ok": true, "score": <0-1>, "accuracy": <0-1>, "pass_count": N, "total": M}}`
 - 打印结果
 
@@ -230,15 +232,15 @@ cat .opencode_fsm/stages/evaluation.sh
 
 写完脚本后，**必须用 terminal 验证测试逻辑的正确性**：
 
-1. 取 train.jsonl 第 1 条数据的**正确答案**作为 completion，跑测试逻辑 → 应得 reward=1.0
-2. 用空字符串作为 completion → 应得 reward=0.0
+1. 取 train.jsonl 第 1 条数据的**正确答案**作为 completion，跑评测逻辑 → 应得 reward=1.0（通过）
+2. 用空字符串作为 completion → 应得 reward=0.0（不通过）
 3. 如果结果不对，修复代码并重新验证
 
 示例验证代码（你需要根据实际数据格式调整）：
 ```python
 import json
 data = json.loads(open('{train_jsonl_path}').readline())
-# ... 用 data 的正确答案测试你的 reward 逻辑 ...
+# ... 用 data 的正确答案测试你的评测 reward 逻辑 ...
 ```
 
 ## 约束
@@ -257,11 +259,11 @@ def build_rollout_repair_prompt(
     repair_attempt: int,
     max_attempts: int,
 ) -> str:
-    """构建 rollout 零分修复 prompt — 让 OpenCode 自主探索诊断并修复 reward 逻辑。"""
+    """构建 rollout 零分修复 prompt — 让 OpenCode 自主探索诊断并修复评测 reward 逻辑。"""
     train_jsonl = str(Path(data_path) / "train.jsonl") if data_path else ""
 
     return f"""Rollout 产生了 {total_samples} 个样本，但只有 {pass_count} 个通过（通过率 {pass_count}/{total_samples}）。
-reward 计算逻辑很可能有问题。这是第 {repair_attempt}/{max_attempts} 次修复尝试。
+评测 reward（通过/不通过判定）逻辑很可能有问题。这是第 {repair_attempt}/{max_attempts} 次修复尝试。
 
 ## 任务描述
 {task_description.strip()}
@@ -297,22 +299,22 @@ for k,v in data.items():
 根据探索结果，自己判断：
 - 模型输出的 completion 是什么样的？
 - 数据中的测试用例是什么格式？
-- rollout.sh 中的 reward 逻辑为什么全部判为 0？是 exec 报错？是字段名不对？是解析方式有问题？
+- rollout.sh 中的评测 reward 逻辑为什么全部判为 0？是 exec 报错？是字段名不对？是解析方式有问题？
 
-## 第二步：修复 reward 计算逻辑
+## 第二步：修复评测 reward 逻辑
 
-根据探索结果，修复 `.opencode_fsm/stages/rollout.sh` 中的 reward 计算逻辑，使其能正确判定模型输出的对错。
+根据探索结果，修复 `.opencode_fsm/stages/rollout.sh` 中的评测 reward 逻辑，使其能正确判定模型输出的对错。
 
 ## 第三步：验证修复（必须做！）
 
 修复后，必须用 terminal 验证：
 
-1. 取 train.jsonl 第 1 条数据的**正确答案**作为 completion，跑 reward 逻辑 → 应得 reward=1.0
-2. 用空字符串或错误答案作为 completion → 应得 reward=0.0
+1. 取 train.jsonl 第 1 条数据的**正确答案**作为 completion，跑评测逻辑 → 应得 reward=1.0（通过）
+2. 用空字符串或错误答案作为 completion → 应得 reward=0.0（不通过）
 3. 如果结果不对，继续修复并重新验证
 
 ## 约束
 - 只能修改 `.opencode_fsm/stages/` 下的文件
-- 不要修改模型加载、推理、数据读取等部分，只修复 reward 计算逻辑
+- 不要修改模型加载、推理、数据读取等部分，只修复评测 reward 逻辑
 - 完成后调用 finish 工具
 """
