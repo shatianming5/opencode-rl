@@ -240,35 +240,31 @@ opencode-rl/
 
 ```mermaid
 flowchart TD
-    Start([main.py]) --> Loop
+    Start(["main.py 启动"]) --> A
 
-    subgraph Loop ["迭代循环 (max_iterations)"]
+    subgraph Iter ["单次迭代  ×  max_iterations 轮"]
         direction TB
-        A["1. 代码生成\n(OpenCode LLM)"] --> B["2. 训练执行\n(train.py)"]
+
+        A["Phase 1 — 代码生成<br/>OpenCode LLM 生成 train.py"]
+        A --> B["Phase 2 — 训练执行<br/>python train.py"]
         B --> C{训练成功?}
-        C -- 失败 --> D["3. 错误修复\n(OpenCode LLM)"]
-        D --> B
-        C -- 成功 --> E{FSM 启用?}
-        E -- 否 --> J
-        E -- 是 --> F
-
-        subgraph FSM ["FSM Deploy / Rollout / Evaluate"]
-            F["4. Deploy\nsetup + health check"] --> G["5. Rollout\n生成训练样本"]
-            G --> H["6. Evaluate\n计算 metrics.json"]
-        end
-
-        H --> I{score > 0?}
-        I -- 否 --> R["自动修复 rollout\n(OpenCode LLM)"]
-        R --> G
-        I -- 是 --> J["7. 分析总结\n(OpenCode LLM)"]
+        C -- "失败 → 修复重试<br/>(OpenCode LLM, 最多 20 次)" --> B
+        C -- 成功 --> D["Phase 3 — 部署模型<br/>vLLM / TGI / Local + 健康检查"]
+        D --> E["Phase 4 — Rollout<br/>用部署模型生成 samples.jsonl"]
+        E --> F{有正 reward?}
+        F -- "全零 → 自动修复重试<br/>(OpenCode LLM, 最多 3 次)" --> E
+        F -- 是 --> G["Phase 5 — 评测打分<br/>FSM evaluate, 缺失则用 samples 计算"]
+        G --> H["Phase 6 — 迭代分析<br/>OpenCode LLM 总结并规划下轮改进"]
     end
 
-    J --> K{还有迭代?}
-    K -- 是 --> A
-    K -- 否 --> End([pipeline_results.json])
+    H --> More{还有迭代?}
+    More -- 是 --> A
+    More -- 否 --> End(["输出 pipeline_results.json"])
 
-    style FSM fill:#f0f4ff,stroke:#4a6fa5
-    style Loop fill:#fafafa,stroke:#999
+    style Iter fill:#f8f9fa,stroke:#dee2e6,stroke-width:2px
+    style D fill:#e3f2fd,stroke:#1976d2
+    style E fill:#e3f2fd,stroke:#1976d2
+    style G fill:#e3f2fd,stroke:#1976d2
 ```
 
 ## 新增 Benchmark
