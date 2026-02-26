@@ -251,9 +251,9 @@ flowchart TD
         C -- "失败 → 修复重试<br/>(OpenCode LLM, 最多 20 次)" --> B
         C -- 成功 --> D["Phase 3 — 部署模型<br/>vLLM / TGI / Local + 健康检查"]
         D --> E["Phase 4 — Rollout<br/>用部署模型生成 samples.jsonl"]
-        E --> F{有正 reward?}
+        E --> F{通过率 > 0?}
         F -- "全零 → 自动修复重试<br/>(OpenCode LLM, 最多 3 次)" --> E
-        F -- 是 --> G["Phase 5 — 评测打分<br/>FSM evaluate, 缺失则用 samples 计算"]
+        F -- 是 --> G["Phase 5 — 评测打分<br/>计算 pass@1 准确率"]
         G --> H["Phase 6 — 迭代分析<br/>OpenCode LLM 总结并规划下轮改进"]
     end
 
