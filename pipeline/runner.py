@@ -30,9 +30,10 @@ _ERR_TRUNCATE = 4000
 # ---------------------------------------------------------------------------
 def _normalize_score(raw) -> float | None:
     """将 [0,1] 的原始分数归一化为 [0,100] 百分制。"""
-    if not isinstance(raw, (int, float)):
+    if raw is None or not isinstance(raw, (int, float)):
         return None
-    return round(raw * 100, 2) if raw <= 1.0 else raw
+    # 阈值 1.05：容忍浮点误差（如 1.001），但已是百分制的（如 50.0）不再缩放
+    return round(raw * 100, 2) if raw <= 1.05 else raw
 
 
 def _find_trained_model(output_dir: str) -> str:
@@ -787,7 +788,7 @@ def run_pipeline(
                     data_path=data_path, output_dir=output_dir,
                 )
                 if fsm_eval and fsm_eval.get("ok"):
-                    eval_score = _normalize_score(fsm_eval.get("score", 0))
+                    eval_score = _normalize_score(fsm_eval.get("score"))
                     eval_source = "FSM evaluate"
 
             # Fallback：复用 rollout 阶段已计算的 samples score
