@@ -4,10 +4,10 @@
 # 真正的评测逻辑由 _scaffold_fsm_evaluation() 调用 OpenCode 生成。
 set -e
 
-RUNTIME_ENV_JSON=".aider_fsm/runtime_env.json"
+RUNTIME_ENV_JSON=".opencode_fsm/runtime_env.json"
 MODEL_PATH=$(jq -r '.model_path' "$RUNTIME_ENV_JSON")
 DATA_PATH=$(jq -r '.data_path' "$RUNTIME_ENV_JSON")
-OUTPUT_DIR="${ROLLOUT_EVAL_ARTIFACTS_DIR:-${AIDER_FSM_ARTIFACTS_DIR:-.aider_fsm/artifacts}}"
+OUTPUT_DIR="${ROLLOUT_EVAL_ARTIFACTS_DIR:-${OPENCODE_FSM_ARTIFACTS_DIR:-.opencode_fsm/artifacts}}"
 
 echo "Model path: $MODEL_PATH"
 echo "Data path: $DATA_PATH"
@@ -16,19 +16,19 @@ echo "Output dir: $OUTPUT_DIR"
 mkdir -p "$OUTPUT_DIR"
 
 export OUTPUT_DIR
-${AIDER_FSM_PYTHON:-python3} << 'PYTHON_SCRIPT'
+${OPENCODE_FSM_PYTHON:-python3} << 'PYTHON_SCRIPT'
 import json
 import os
 import time
 from pathlib import Path
 
-RUNTIME_ENV_JSON = os.getenv('RUNTIME_ENV_JSON', '.aider_fsm/runtime_env.json')
+RUNTIME_ENV_JSON = os.getenv('RUNTIME_ENV_JSON', '.opencode_fsm/runtime_env.json')
 with open(RUNTIME_ENV_JSON, 'r') as f:
     runtime_env = json.load(f)
 
 MODEL_PATH = runtime_env['model_path']
 DATA_PATH = runtime_env['data_path']
-OUTPUT_DIR = os.getenv('OUTPUT_DIR', runtime_env.get('output_dir', '.aider_fsm/artifacts'))
+OUTPUT_DIR = os.getenv('OUTPUT_DIR', runtime_env.get('output_dir', '.opencode_fsm/artifacts'))
 
 print(f"Loading model from {MODEL_PATH}")
 
@@ -116,7 +116,7 @@ rollout_info = {
     "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
 }
 
-rollout_json = Path(".aider_fsm") / "rollout.json"
+rollout_json = Path(".opencode_fsm") / "rollout.json"
 with open(rollout_json, 'w') as f:
     json.dump(rollout_info, f, indent=2)
 

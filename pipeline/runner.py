@@ -9,11 +9,11 @@ from pathlib import Path
 from .phases import (
     phase_analysis,
     phase_code_generation,
-    phase_evaluation,
     phase_fix_training,
     phase_training,
 )
 from .types import IterationResult
+from .prompts import build_scaffold_prompt, build_rollout_repair_prompt
 from .stream import make_stream_printer
 from .utils import get_data_stats, get_gpu_info
 
@@ -25,23 +25,27 @@ from .utils import get_data_stats, get_gpu_info
 class _FSMProgressMonitor:
     """后台线程，定时扫描 FSM artifacts 目录显示进度。"""
 
-    def __init__(self, label: str, target_repo: str, total_samples: int = 0, interval: float = 15.0):
+    def __init__(self, label: str, target_repo: str, total_samples: int = 0,
+                 interval: float = 15.0, is_evaluate: bool = False):
         self._label = label
         self._target_repo = Path(target_repo).resolve()
         self._total = total_samples
         self._interval = interval
+        self._is_evaluate = is_evaluate
         self._stop = threading.Event()
         self._start_time = time.time()
         self._thread: threading.Thread | None = None
+        self._last_metrics_mtime: float = 0
+        self._last_log_size: int = 0
 
     def _find_samples_jsonl(self) -> Path | None:
         """搜索可能的 samples.jsonl 路径。"""
         candidates = [
-            self._target_repo / ".aider_fsm" / "artifacts" / "samples.jsonl",
-            self._target_repo / ".aider_fsm" / "samples.jsonl",
+            self._target_repo / ".opencode_fsm" / "artifacts" / "samples.jsonl",
+            self._target_repo / ".opencode_fsm" / "samples.jsonl",
         ]
         # 也检查 rollout.json 里记录的路径
-        rollout_json = self._target_repo / ".aider_fsm" / "rollout.json"
+        rollout_json = self._target_repo / ".opencode_fsm" / "rollout.json"
         if rollout_json.exists():
             try:
                 obj = json.loads(rollout_json.read_text())
@@ -76,8 +80,74 @@ class _FSMProgressMonitor:
             pass
         return total, passed
 
+    def _read_metrics(self) -> dict | None:
+        """读取 metrics.json（evaluate 阶段用）。"""
+        metrics_path = self._target_repo / ".opencode_fsm" / "metrics.json"
+        if not metrics_path.exists():
+            return None
+        try:
+            mtime = metrics_path.stat().st_mtime
+            if mtime > self._last_metrics_mtime:
+                self._last_metrics_mtime = mtime
+                return json.loads(metrics_path.read_text())
+        except Exception:
+            pass
+        return None
+
+    def _tail_eval_log(self, max_lines: int = 3) -> str | None:
+        """尝试读取评测日志的最后几行。"""
+        log_candidates = [
+            self._target_repo / ".opencode_fsm" / "eval.log",
+            self._target_repo / ".opencode_fsm" / "evaluation.log",
+        ]
+        # 也搜索 artifacts 下的 log 文件
+        artifacts = self._target_repo / ".opencode_fsm" / "artifacts"
+        if artifacts.exists():
+            for log_file in sorted(artifacts.rglob("*.log"), key=lambda p: p.stat().st_mtime, reverse=True):
+                log_candidates.insert(0, log_file)
+                break
+
+        for log_path in log_candidates:
+            if not log_path.exists():
+                continue
+            try:
+                size = log_path.stat().st_size
+                if size <= self._last_log_size:
+                    continue
+                self._last_log_size = size
+                with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+                    lines = f.readlines()
+                tail = [l.rstrip() for l in lines[-max_lines:] if l.strip()]
+                if tail:
+                    return " | ".join(tail)
+            except Exception:
+                pass
+        return None
+
     def _tick(self):
         elapsed = time.time() - self._start_time
+
+        # Evaluate 阶段：优先展示 metrics.json 和评测日志
+        if self._is_evaluate:
+            metrics = self._read_metrics()
+            if metrics:
+                score = metrics.get("accuracy", metrics.get("score", "?"))
+                passed = metrics.get("pass_count", "?")
+                total = metrics.get("total", "?")
+                print(
+                    f"  [{self._label}] {elapsed:.0f}s | score={score}, passed={passed}/{total}",
+                    flush=True,
+                )
+                return
+
+            log_tail = self._tail_eval_log()
+            if log_tail:
+                # 截断过长的日志行
+                if len(log_tail) > 120:
+                    log_tail = log_tail[:117] + "..."
+                print(f"  [{self._label}] {elapsed:.0f}s | {log_tail}", flush=True)
+                return
+
         samples_path = self._find_samples_jsonl()
         if samples_path:
             done, passed = self._count_samples(samples_path)
@@ -89,8 +159,8 @@ class _FSMProgressMonitor:
             )
         else:
             # 还没开始写 samples，看看有没有其他文件变化
-            artifacts = self._target_repo / ".aider_fsm" / "artifacts"
-            runtime = self._target_repo / ".aider_fsm" / "runtime_env.json"
+            artifacts = self._target_repo / ".opencode_fsm" / "artifacts"
+            runtime = self._target_repo / ".opencode_fsm" / "runtime_env.json"
             if runtime.exists():
                 print(f"  [{self._label}] {elapsed:.0f}s | model deployed, generating...", flush=True)
             elif artifacts.exists():
@@ -225,7 +295,7 @@ def _read_fsm_metrics(target_repo: str, max_age_seconds: int = 600) -> dict | No
     优先取 accuracy（真实评测指标），score 字段实际是 avg_reward。
     同时检查文件新鲜度，避免读到上一轮的过期数据。
     """
-    metrics_path = Path(target_repo) / ".aider_fsm" / "metrics.json"
+    metrics_path = Path(target_repo) / ".opencode_fsm" / "metrics.json"
     if not metrics_path.exists():
         return None
     try:
@@ -282,7 +352,7 @@ def _try_fsm_evaluate(
 
     try:
         target_repo = fsm_config.get("target_repo", ".")
-        with _FSMProgressMonitor("FSM Evaluate", target_repo):
+        with _FSMProgressMonitor("FSM Evaluate", target_repo, is_evaluate=True):
             result = bridge.evaluate(model_path=model_path, mode=fsm_config.get("mode", "smoke"))
         if result and result.get("ok"):
             print(f"  FSM evaluate OK: score={result.get('score')}")
@@ -299,96 +369,6 @@ def _try_fsm_evaluate(
     except Exception as e:
         print(f"  FSM evaluate error: {e}")
         return None
-
-
-def _build_scaffold_prompt(
-    task_description: str,
-    data_path: str,
-    sample_count: int,
-) -> str:
-    """构建 scaffold prompt — 让 OpenCode 自主探索数据并编写评测脚本。"""
-    train_jsonl_path = str(Path(data_path) / "train.jsonl") if data_path else ""
-
-    return f"""你是评测脚本工程师。任务：重写 `.aider_fsm/stages/rollout.sh` 和 `.aider_fsm/stages/evaluation.sh`。
-
-## 第一步：自主探索（必须先做，不要跳过）
-
-用 terminal 执行以下命令，理解数据格式和现有脚本：
-
-```bash
-# 1. 看数据格式和字段
-head -2 {train_jsonl_path}
-python3 -c "import json; d=json.loads(open('{train_jsonl_path}').readline()); print({{k: type(v).__name__ for k,v in d.items()}})"
-python3 -c "import json; d=json.loads(open('{train_jsonl_path}').readline()); [print(f'  {{k}}: {{repr(v)[:200]}}') for k,v in d.items()]"
-
-# 2. 看现有脚本了解结构
-cat .aider_fsm/stages/deploy_setup.sh
-cat .aider_fsm/stages/rollout.sh
-cat .aider_fsm/stages/evaluation.sh
-```
-
-根据探索结果，自己判断：
-- 数据有哪些字段？哪个是 prompt？哪个是测试用例？
-- 测试用例是什么格式？（字符串？列表？assert 语句？check 函数？）
-- 怎么用测试用例验证模型输出的正确性？
-
-## 第二步：任务描述
-
-{task_description.strip()}
-
-## 重要：骨架脚本说明
-
-当前 `rollout.sh` 是一个**通用骨架**，reward 全部写 0.0（占位符）。你**必须**替换为真正的评测逻辑。
-当前 `evaluation.sh` 已经是通用的（读 samples.jsonl → 算 reward>=1.0 比例 → 写 metrics.json），通常不需要修改，除非 reward 的含义与 pass/fail 不同。
-
-## 第三步：重写 rollout.sh
-
-**职责**：加载训练后模型 → 对每条数据生成 completion → 用真实测试判定对错 → 写结果
-
-### 输入输出合约
-- 输入：`.aider_fsm/runtime_env.json`（含 `model_path`, `data_path`）
-- 输出 1：`$OUTPUT_DIR/samples.jsonl` — 每行 `{{"prompt": "...", "completion": "...", "reward": 0.0或1.0, "task_id": "..."}}`
-- 输出 2：`.aider_fsm/rollout.json` — `{{"paths": {{"samples_jsonl": "<绝对路径>"}}, "num_samples": N}}`
-- OUTPUT_DIR 取 `${{ROLLOUT_EVAL_ARTIFACTS_DIR:-${{AIDER_FSM_ARTIFACTS_DIR:-.aider_fsm/artifacts}}}}`
-
-### 硬约束
-| 约束 | 要求 |
-|------|------|
-| 评测范围 | **全量 {sample_count} 条**，禁止截断（不能有 EVAL_LIMIT=5） |
-| reward 真实性 | 必须用 exec() 执行真实测试用例，禁止字符串匹配或"非空=1" |
-| 超时保护 | 每条样本测试执行最多 **5 秒**（用 multiprocessing.Pool + timeout） |
-| GPU 推理 | torch.bfloat16 + device_map="auto"，禁止 CPU float32 |
-| Chat 模板 | 训练用 chat prompt，推理也要用 tokenizer.apply_chat_template |
-| 总运行时间 | 控制在 **20 分钟**以内 |
-| 进度输出 | 每 10 条打印 `[Rollout] done/total, passed, elapsed`，全部 flush=True |
-
-## 第四步：重写 evaluation.sh
-
-- 读 `.aider_fsm/rollout.json` → 找 samples.jsonl
-- 算 pass@1 = (reward >= 1.0 的样本数) / 总数
-- 写 `.aider_fsm/metrics.json`：`{{"ok": true, "score": <0-1>, "accuracy": <0-1>, "pass_count": N, "total": M}}`
-- 打印结果
-
-## 第五步：Dry-run 验证（必须做！）
-
-写完脚本后，**必须用 terminal 验证测试逻辑的正确性**：
-
-1. 取 train.jsonl 第 1 条数据的**正确答案**作为 completion，跑测试逻辑 → 应得 reward=1.0
-2. 用空字符串作为 completion → 应得 reward=0.0
-3. 如果结果不对，修复代码并重新验证
-
-示例验证代码（你需要根据实际数据格式调整）：
-```python
-import json
-data = json.loads(open('{train_jsonl_path}').readline())
-# ... 用 data 的正确答案测试你的 reward 逻辑 ...
-```
-
-## 约束
-- 只能修改 `.aider_fsm/stages/` 下的文件
-- 预装库：torch, transformers, datasets, json, multiprocessing
-- 完成后调用 finish 工具
-"""
 
 
 def _scaffold_fsm_evaluation(
@@ -423,10 +403,10 @@ def _scaffold_fsm_evaluation(
             with open(p, "r") as f:
                 sample_count = sum(1 for _ in f)
 
-    prompt = _build_scaffold_prompt(task_description, data_path, sample_count)
+    prompt = build_scaffold_prompt(task_description, data_path, sample_count)
 
     # Create OpenCodeClient
-    out_dir = repo_root / ".aider_fsm" / "scaffold_logs"
+    out_dir = repo_root / ".opencode_fsm" / "scaffold_logs"
     out_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"  Prompt: {len(prompt)} chars, starting OpenCode server...", flush=True)
@@ -441,6 +421,7 @@ def _scaffold_fsm_evaluation(
             bash_mode="restricted",
             scaffold_bash_mode="full",
             unattended="strict",
+            max_turns=40,  # scaffold needs more turns: explore data + write + verify
             server_log_path=out_dir / "opencode_server.log",
             session_title="scaffold_evaluation",
         )
@@ -462,10 +443,133 @@ def _scaffold_fsm_evaluation(
             (out_dir / "scaffold_result.txt").write_text(
                 result.assistant_text[-20000:], encoding="utf-8",
             )
+
+        # Verify scaffold actually rewrote rollout.sh with real evaluation logic
+        rollout_sh = repo_root / ".opencode_fsm" / "stages" / "rollout.sh"
+        if rollout_sh.exists():
+            content = rollout_sh.read_text(encoding="utf-8")
+            # Check if the skeleton placeholder is still present (not rewritten)
+            if "# SKELETON" in content and "reward = 0.0" in content:
+                print("  WARNING: rollout.sh still contains skeleton placeholder — scaffold did not rewrite it")
+                return False
+            # Check that the script has some real evaluation logic (not just model loading)
+            if "reward" not in content.lower():
+                print("  WARNING: rollout.sh missing reward logic after scaffold")
+                return False
+            print(f"  Scaffold verification OK: rollout.sh rewritten ({len(content)} bytes)")
+        else:
+            print("  WARNING: rollout.sh not found after scaffold")
+            return False
+
         return True
     except Exception as e:
         print(f"  FSM scaffold: agent error: {e}")
         (out_dir / "scaffold_error.txt").write_text(str(e)[:4000], encoding="utf-8")
+        return False
+    finally:
+        try:
+            agent.close()
+        except Exception:
+            pass
+
+
+def _repair_rollout_zero_reward(
+    workspace: str,
+    fsm_config: dict,
+    samples_path: str,
+    task_description: str,
+    data_path: str,
+    repair_attempt: int,
+    max_attempts: int,
+) -> bool:
+    """调用 OpenCode 自主诊断并修复 rollout.sh 中的 reward 计算逻辑。
+
+    Returns True if repair agent completed successfully, False otherwise.
+    """
+    try:
+        from runner_fsm.opencode.client import OpenCodeClient
+    except ImportError:
+        print("  Rollout repair: runner_fsm not available, skipping")
+        return False
+
+    target_repo = fsm_config.get("target_repo", ".")
+    repo_root = Path(target_repo).resolve()
+
+    print(f"\n{'='*60}")
+    print(f"  Rollout Repair: attempt {repair_attempt}/{max_attempts}")
+    print(f"{'='*60}")
+
+    # Count total samples and pass count from samples file
+    total_samples = 0
+    pass_count = 0
+    try:
+        with open(samples_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                total_samples += 1
+                try:
+                    r = json.loads(line).get("reward", 0)
+                    if float(r) >= 1.0:
+                        pass_count += 1
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    prompt = build_rollout_repair_prompt(
+        samples_path=samples_path,
+        data_path=data_path,
+        task_description=task_description,
+        pass_count=pass_count,
+        total_samples=total_samples,
+        repair_attempt=repair_attempt,
+        max_attempts=max_attempts,
+    )
+
+    out_dir = repo_root / ".opencode_fsm" / "scaffold_logs"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"  Prompt: {len(prompt)} chars, starting OpenCode server...", flush=True)
+    try:
+        agent = OpenCodeClient(
+            repo=repo_root,
+            plan_rel="PLAN.md",
+            pipeline_rel="pipeline.yml",
+            model=fsm_config.get("opencode_model", "") or os.environ.get("OPENCODE_MODEL", ""),
+            base_url=fsm_config.get("opencode_url", "") or None,
+            timeout_seconds=600,
+            bash_mode="restricted",
+            scaffold_bash_mode="full",
+            unattended="strict",
+            max_turns=30,
+            server_log_path=out_dir / f"opencode_rollout_repair_{repair_attempt}.log",
+            session_title=f"rollout_repair_{repair_attempt}",
+        )
+    except Exception as e:
+        print(f"  Rollout repair: failed to create OpenCodeClient: {e}")
+        return False
+
+    try:
+        result = agent.run(
+            prompt,
+            fsm_state="S0_SCAFFOLD",
+            iter_idx=0,
+            purpose="repair_contract",
+            on_turn=make_stream_printer("RolloutRepair"),
+        )
+        print(f"  Rollout repair: agent completed")
+        if result.assistant_text:
+            (out_dir / f"rollout_repair_{repair_attempt}_result.txt").write_text(
+                result.assistant_text[-20000:], encoding="utf-8",
+            )
+        return True
+    except Exception as e:
+        print(f"  Rollout repair: agent error: {e}")
+        (out_dir / f"rollout_repair_{repair_attempt}_error.txt").write_text(
+            str(e)[:4000], encoding="utf-8",
+        )
         return False
     finally:
         try:
@@ -483,6 +587,8 @@ def run_pipeline(
     max_iterations: int = 5,
     training_timeout: int = 3600,
     max_agent_steps: int = 25,
+    max_fix_retries: int = 2,
+    max_rollout_repair_retries: int = 2,
     fsm_config: dict | None = None,
 ):
     """运行固定阶段 Pipeline
@@ -491,11 +597,10 @@ def run_pipeline(
       Phase 1: Agent 写代码（探索数据 + 编写 train.py）
       Phase 2: Pipeline 执行训练（subprocess）
       Phase FSM-Deploy: （可选）FSM 部署模型 + rollout 采样
-      Phase 3: Pipeline 提交评测（HTTP POST 或 FSM evaluate）
+      Phase 3: FSM evaluate / samples 本地评测
       Phase 4: 记录结果，注入到下轮 prompt
     """
     pipeline_start = time.time()
-    grading_url = os.environ.get("GRADING_SERVER_URL", "http://localhost:5000")
     fsm_config = fsm_config or {}
 
     if not data_path:
@@ -514,7 +619,6 @@ def run_pipeline(
     print(f"  Max iterations: {max_iterations}")
     print(f"  Training timeout: {training_timeout}s")
     print(f"  Agent steps/iter: {max_agent_steps}")
-    print(f"  Grading Server: {grading_url}")
     print(f"  FSM enabled: {fsm_config.get('enabled', False)}")
     opencode_model = os.environ.get("OPENCODE_MODEL", "")
     opencode_url = os.environ.get("OPENCODE_URL", "")
@@ -540,7 +644,7 @@ def run_pipeline(
     history: list[IterationResult] = []
     best_score: float | None = None
     best_iteration = -1
-    max_fix_retries = 2
+    # max_fix_retries passed from caller
 
     # Phase FSM-Scaffold: 在迭代开始前让 OpenCode 生成 task-specific 的 evaluation.sh
     if fsm_config.get("enabled") and task_description.strip():
@@ -596,6 +700,7 @@ def run_pipeline(
                     code_path, training_log_path, data_path, workspace,
                     opencode_model=opencode_model,
                     opencode_url=opencode_url,
+                    max_agent_steps=max_agent_steps,
                 )
                 print(f"  Agent fix attempt done, re-running training...")
             except Exception as e:
@@ -613,7 +718,7 @@ def run_pipeline(
         result.stdout = stdout
         result.training_time = train_time
 
-        # Phase FSM: Deploy + Rollout（训练成功后）
+        # Phase FSM: Deploy + Rollout + Evaluate（含零分自动修复循环）
         if exit_code == 0 and fsm_config.get("enabled"):
             out_path = Path(output_dir)
             subdirs = [d for d in out_path.iterdir() if d.is_dir() and not d.name.startswith(".")]
@@ -622,18 +727,61 @@ def run_pipeline(
             else:
                 trained_model = str(out_path)
 
-            fsm_result = _try_fsm_deploy_and_rollout(
-                workspace, trained_model, fsm_config,
-                data_path=data_path, output_dir=output_dir,
-            )
-            if fsm_result and fsm_result.get("ok"):
+            for rollout_attempt in range(max_rollout_repair_retries + 1):
+                # Step 1: Deploy + Rollout
+                fsm_result = _try_fsm_deploy_and_rollout(
+                    workspace, trained_model, fsm_config,
+                    data_path=data_path, output_dir=output_dir,
+                )
+
+                # Step 2: 结构性失败 → 不重试
+                if not fsm_result or not fsm_result.get("ok"):
+                    break
+
                 samples_path = fsm_result.get("samples_path", "")
                 result.samples_path = samples_path
 
-        # Phase 3: Evaluation
-        if exit_code == 0:
-            eval_result = None
+                # Step 3: 计算 pass_count
+                if samples_path:
+                    samples_score = _compute_score_from_samples(samples_path)
+                else:
+                    samples_score = None
 
+                pass_count = 0
+                if samples_score and samples_score.get("ok"):
+                    pass_count = samples_score.get("pass_count", 0)
+
+                # Step 4: pass_count > 0 或已用完重试次数 → 结束循环
+                if pass_count > 0 or rollout_attempt >= max_rollout_repair_retries:
+                    break
+
+                # Step 5: 全零 reward → 调用 OpenCode 自主修复
+                print(f"\n  All {samples_score.get('total', 0)} samples got reward=0.0, attempting auto-repair...")
+                repair_ok = _repair_rollout_zero_reward(
+                    workspace=workspace,
+                    fsm_config=fsm_config,
+                    samples_path=samples_path,
+                    task_description=task_description,
+                    data_path=data_path,
+                    repair_attempt=rollout_attempt + 1,
+                    max_attempts=max_rollout_repair_retries,
+                )
+
+                # Step 6: 修复失败 → 不重试
+                if not repair_ok:
+                    print(f"  Rollout repair failed, continuing with zero score")
+                    break
+
+                # Step 7: 修复成功 → continue 重跑 rollout
+                print(f"  Rollout repair completed, re-running rollout...")
+
+        # Phase 3: Evaluation（本地：FSM evaluate → samples fallback）
+        if exit_code == 0:
+            eval_score: float | None = None
+            eval_source = ""
+            trained_model = ""
+
+            # 优先：FSM evaluate
             if fsm_config.get("enabled"):
                 out_path = Path(output_dir)
                 subdirs = [d for d in out_path.iterdir() if d.is_dir() and not d.name.startswith(".")]
@@ -643,48 +791,31 @@ def run_pipeline(
                     data_path=data_path, output_dir=output_dir,
                 )
                 if fsm_eval and fsm_eval.get("ok"):
-                    fsm_score = fsm_eval.get("score", 0)
-                    # FSM 返回 0-1 范围，grading server 期望 0-100
-                    if isinstance(fsm_score, (int, float)) and fsm_score <= 1.0:
-                        fsm_score = round(fsm_score * 100, 2)
-                    eval_result = phase_evaluation(workspace, grading_url, pre_computed_score=fsm_score)
-                    # Fallback: grading server 不可用时回退到本地 dict
-                    if eval_result is None:
-                        eval_result = {
-                            "score": fsm_score,
-                            "improvement": fsm_eval.get("improvement"),
-                            "best": {"score": fsm_eval.get("best_score")},
-                            "model_path": trained_model,
-                        }
+                    raw = fsm_eval.get("score", 0)
+                    eval_score = round(raw * 100, 2) if isinstance(raw, (int, float)) and raw <= 1.0 else raw
+                    eval_source = "FSM evaluate"
 
-            # Fallback: 直接从 rollout samples 算 score（最可靠）
-            if eval_result is None and result.samples_path:
+            # Fallback：直接从 rollout samples 算 pass@1
+            if eval_score is None and result.samples_path:
                 samples_score = _compute_score_from_samples(result.samples_path)
                 if samples_score and samples_score.get("ok"):
                     raw = samples_score["score"]
-                    pct = round(raw * 100, 2) if isinstance(raw, (int, float)) and raw <= 1.0 else raw
-                    eval_result = phase_evaluation(workspace, grading_url, pre_computed_score=pct)
-                    if eval_result is None:
-                        eval_result = {
-                            "score": pct,
-                            "improvement": None,
-                            "best": {"score": None},
-                            "model_path": trained_model if fsm_config.get("enabled") else "",
-                            "source": "samples_direct",
-                        }
+                    eval_score = round(raw * 100, 2) if isinstance(raw, (int, float)) and raw <= 1.0 else raw
+                    eval_source = f"samples ({samples_score['pass_count']}/{samples_score['total']})"
 
-            if eval_result is None:
-                eval_result = phase_evaluation(workspace, grading_url)
-
-            if eval_result:
-                result.score = eval_result.get("score")
-                result.improvement = eval_result.get("improvement")
-                result.best_score = eval_result.get("best", {}).get("score")
-                result.model_path = eval_result.get("model_path", "")
-
-                if best_score is None or (result.score is not None and result.score > best_score):
-                    best_score = result.score
+            print(f"\n{'='*60}")
+            print(f"  Phase 3: Evaluation")
+            print(f"{'='*60}")
+            if eval_score is not None:
+                print(f"  Score: {eval_score}")
+                print(f"  Source: {eval_source}")
+                result.score = eval_score
+                result.model_path = trained_model
+                if best_score is None or eval_score > best_score:
+                    best_score = eval_score
                     best_iteration = iteration
+            else:
+                print(f"  No score available (FSM and samples both failed)")
 
         # Phase Analysis: 让 OpenCode 自分析（非最后一轮时执行）
         if iteration < max_iterations:
@@ -696,6 +827,7 @@ def run_pipeline(
                     task_description=task_description,
                     opencode_model=opencode_model,
                     opencode_url=opencode_url,
+                    max_agent_steps=max_agent_steps,
                 )
                 result.analysis = analysis
             except Exception as e:

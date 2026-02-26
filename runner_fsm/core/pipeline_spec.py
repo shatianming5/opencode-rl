@@ -69,7 +69,7 @@ class PipelineSpec:
     # artifacts
     artifacts_out_dir: str | None = None
 
-    # tooling (deprecated; prefer .aider_fsm/actions.yml)
+    # tooling (deprecated; prefer .opencode_fsm/actions.yml)
     tooling_ensure_tools: bool = False
     tooling_ensure_kind_cluster: bool = False
     tooling_kind_cluster_name: str = "kind"

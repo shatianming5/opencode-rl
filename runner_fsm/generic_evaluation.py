@@ -4,7 +4,7 @@ import os
 import sys
 
 # Support running either as a module (`python -m runner.generic_evaluation`) or as a
-# script (`python $AIDER_FSM_RUNNER_ROOT/runner/generic_evaluation.py`). The latter
+# script (`python $OPENCODE_FSM_RUNNER_ROOT/runner/generic_evaluation.py`). The latter
 # avoids module-name collisions with target repos that may contain their own `runner/`
 # package.
 if __package__ in (None, ""):
@@ -42,7 +42,7 @@ def _write_json(path: Path, obj: dict) -> None:
 
 def _reward_average_from_rollout(repo_root: Path) -> tuple[bool, float, dict[str, int] | None, str]:
     """Compute score as average `reward` across rollout samples (best-effort)."""
-    rollout_path = (repo_root / ".aider_fsm" / "rollout.json").resolve()
+    rollout_path = (repo_root / ".opencode_fsm" / "rollout.json").resolve()
     if not rollout_path.exists():
         return False, 0.0, None, f"missing_rollout_json: {rollout_path}"
 
@@ -97,21 +97,21 @@ def _reward_average_from_rollout(repo_root: Path) -> tuple[bool, float, dict[str
     return True, float(score), {"samples": int(total), "bad_lines": int(bad)}, "reward_average"
 
 def main() -> int:
-    repo_root = Path(os.environ.get("AIDER_FSM_REPO_ROOT") or ".").resolve()
-    metrics_path = Path(os.environ.get("AIDER_FSM_METRICS_PATH") or ".aider_fsm/metrics.json")
+    repo_root = Path(os.environ.get("OPENCODE_FSM_REPO_ROOT") or ".").resolve()
+    metrics_path = Path(os.environ.get("OPENCODE_FSM_METRICS_PATH") or ".opencode_fsm/metrics.json")
     if not metrics_path.is_absolute():
         metrics_path = (repo_root / metrics_path).resolve()
 
-    hints_path = (repo_root / ".aider_fsm" / "hints_used.json").resolve()
-    hints_run_path = (repo_root / ".aider_fsm" / "hints_run.json").resolve()
-    require_hints = _is_truthy(os.environ.get("AIDER_FSM_REQUIRE_HINTS"))
+    hints_path = (repo_root / ".opencode_fsm" / "hints_used.json").resolve()
+    hints_run_path = (repo_root / ".opencode_fsm" / "hints_run.json").resolve()
+    require_hints = _is_truthy(os.environ.get("OPENCODE_FSM_REQUIRE_HINTS"))
 
     try:
-        timeout = int(os.environ.get("AIDER_FSM_HINT_TIMEOUT_SECONDS") or 600)
+        timeout = int(os.environ.get("OPENCODE_FSM_HINT_TIMEOUT_SECONDS") or 600)
     except Exception:
         timeout = 600
     try:
-        max_attempts = int(os.environ.get("AIDER_FSM_HINT_MAX_ATTEMPTS") or 3)
+        max_attempts = int(os.environ.get("OPENCODE_FSM_HINT_MAX_ATTEMPTS") or 3)
     except Exception:
         max_attempts = 3
 

@@ -52,7 +52,7 @@ def _chat_completion(
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
     if max_tokens is None:
-        raw = (os.environ.get("AIDER_FSM_MAX_TOKENS") or "").strip()
+        raw = (os.environ.get("OPENCODE_FSM_MAX_TOKENS") or "").strip()
         n = None
         if raw:
             try:
@@ -247,15 +247,15 @@ def _maybe_rollout_hf_qa_parquet(
     return True, rollout
 
 def main() -> int:
-    repo_root = Path(os.environ.get("AIDER_FSM_REPO_ROOT") or ".").resolve()
-    artifacts_dir = Path(os.environ.get("AIDER_FSM_ARTIFACTS_DIR") or (repo_root / ".aider_fsm" / "artifacts"))
+    repo_root = Path(os.environ.get("OPENCODE_FSM_REPO_ROOT") or ".").resolve()
+    artifacts_dir = Path(os.environ.get("OPENCODE_FSM_ARTIFACTS_DIR") or (repo_root / ".opencode_fsm" / "artifacts"))
     if not artifacts_dir.is_absolute():
         artifacts_dir = (repo_root / artifacts_dir).resolve()
     artifacts_dir.mkdir(parents=True, exist_ok=True)
 
-    mode = (os.environ.get("AIDER_EVAL_MODE") or "smoke").strip().lower() or "smoke"
+    mode = (os.environ.get("OPENCODE_EVAL_MODE") or "smoke").strip().lower() or "smoke"
     try:
-        limit = int(os.environ.get("AIDER_EVAL_LIMIT") or (64 if mode == "full" else 8))
+        limit = int(os.environ.get("OPENCODE_EVAL_LIMIT") or (64 if mode == "full" else 8))
     except Exception:
         limit = 8
     limit = max(1, int(limit))
@@ -264,7 +264,7 @@ def main() -> int:
     if base_url:
         base_url = base_url.rstrip("/")
     else:
-        runtime_path = (os.environ.get("AIDER_RUNTIME_ENV_PATH") or "").strip()
+        runtime_path = (os.environ.get("OPENCODE_RUNTIME_ENV_PATH") or "").strip()
         if runtime_path:
             p = Path(runtime_path)
             if not p.is_absolute():
@@ -288,9 +288,9 @@ def main() -> int:
     if not base_url:
         base_url = "https://api.openai.com/v1"
     api_key = (os.environ.get("OPENAI_API_KEY") or "").strip() or None
-    model = (os.environ.get("AIDER_LLM_MODEL") or os.environ.get("OPENAI_MODEL") or "").strip()
+    model = (os.environ.get("OPENCODE_LLM_MODEL") or os.environ.get("OPENAI_MODEL") or "").strip()
     if not model:
-        raise SystemExit("missing_model: set AIDER_LLM_MODEL or OPENAI_MODEL")
+        raise SystemExit("missing_model: set OPENCODE_LLM_MODEL or OPENAI_MODEL")
 
     # HF dataset snapshot support: if detected, generate QA samples with rewards.
     ok_ds, ds_rollout = _maybe_rollout_hf_qa_parquet(
@@ -303,14 +303,14 @@ def main() -> int:
         limit=limit,
     )
     if ok_ds:
-        rollout_path = (repo_root / ".aider_fsm" / "rollout.json").resolve()
+        rollout_path = (repo_root / ".opencode_fsm" / "rollout.json").resolve()
         rollout_path.parent.mkdir(parents=True, exist_ok=True)
         rollout_path.write_text(json.dumps(ds_rollout, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         return 0
 
     # Default: generic, bounded "repo understanding" prompts (cap for safety).
     prompt_limit = max(1, min(int(limit), 32))
-    hints = _parse_json_str_list(os.environ.get("AIDER_FSM_HINTS_JSON"))
+    hints = _parse_json_str_list(os.environ.get("OPENCODE_FSM_HINTS_JSON"))
     prompts: list[str] = []
     for h in hints[: max(0, prompt_limit)]:
         prompts.append(f"Explain how to run this command and what it does:\n\n{h}")
@@ -361,7 +361,7 @@ def main() -> int:
             f.write(json.dumps(obj, ensure_ascii=False) + "\n")
             samples_written += 1
 
-    rollout_path = (repo_root / ".aider_fsm" / "rollout.json").resolve()
+    rollout_path = (repo_root / ".opencode_fsm" / "rollout.json").resolve()
     rollout_path.parent.mkdir(parents=True, exist_ok=True)
     rollout = {
         "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime()),

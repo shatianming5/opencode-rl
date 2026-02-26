@@ -67,6 +67,7 @@ class OpenCodeClient(AgentClient):
         bash_mode: str,
         scaffold_bash_mode: str = "full",
         unattended: str,
+        max_turns: int = 20,
         server_log_path: Path | None = None,
         username: str | None = None,
         password: str | None = None,
@@ -85,7 +86,7 @@ class OpenCodeClient(AgentClient):
         _recover_attempts_raw = (
             session_recover_attempts
             if session_recover_attempts is not None
-            else os.environ.get("AIDER_OPENCODE_SESSION_RECOVER_ATTEMPTS", "2")
+            else os.environ.get("OPENCODE_SESSION_RECOVER_ATTEMPTS", "2")
         )
         try:
             self._session_recover_attempts = max(0, int(_recover_attempts_raw or 0))
@@ -94,7 +95,7 @@ class OpenCodeClient(AgentClient):
         _recover_backoff_raw = (
             session_recover_backoff_seconds
             if session_recover_backoff_seconds is not None
-            else os.environ.get("AIDER_OPENCODE_SESSION_RECOVER_BACKOFF_SECONDS", "2.0")
+            else os.environ.get("OPENCODE_SESSION_RECOVER_BACKOFF_SECONDS", "2.0")
         )
         try:
             self._session_recover_backoff_seconds = max(0.0, float(_recover_backoff_raw or 0.0))
@@ -116,6 +117,7 @@ class OpenCodeClient(AgentClient):
         self._scaffold_bash_mode = (scaffold_bash_mode or "full").strip().lower()
         if self._scaffold_bash_mode not in ("restricted", "full"):
             raise ValueError("invalid_scaffold_bash_mode")
+        self._max_turns = max(1, int(max_turns or 20))
         self._unattended = str(unattended or "strict").strip().lower() or "strict"
         self._session_title = str(session_title or f"runner:{repo.name}")
         self._server_log_path = server_log_path.resolve() if server_log_path is not None else None
@@ -386,7 +388,7 @@ class OpenCodeClient(AgentClient):
 
         prompt = text
         trace: list[dict[str, Any]] = []
-        for turn_idx in range(20):
+        for turn_idx in range(self._max_turns):
             monitor = self._LLMWaitMonitor(self._token_log_path, turn_idx + 1) if on_turn else None
             try:
                 if monitor:
@@ -501,7 +503,7 @@ class OpenCodeClient(AgentClient):
 
             prompt = format_tool_results(results)
 
-        raise RuntimeError("OpenCode tool loop exceeded 20 turns without a final response.")
+        raise RuntimeError(f"OpenCode tool loop exceeded {self._max_turns} turns without a final response.")
 
     def _start_local_server(
         self,

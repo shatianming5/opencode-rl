@@ -147,10 +147,10 @@ def run_hints(
     repo = Path(repo).resolve()
     env2 = dict(env or os.environ)
 
-    raw_hints = _parse_json_str_list(env2.get("AIDER_FSM_HINTS_JSON"))
+    raw_hints = _parse_json_str_list(env2.get("OPENCODE_FSM_HINTS_JSON"))
     if not raw_hints:
         hints_file: Path | None = None
-        artifacts_root = (repo / ".aider_fsm" / "artifacts").resolve()
+        artifacts_root = (repo / ".opencode_fsm" / "artifacts").resolve()
         if artifacts_root.exists():
             candidates = list(artifacts_root.glob("*/scaffold/scaffold_command_hints.txt"))
             if candidates:
@@ -168,16 +168,16 @@ def run_hints(
                     continue
                 raw_hints.append(line)
 
-    anchors = _parse_json_str_list(env2.get("AIDER_FSM_HINT_ANCHORS_JSON"))
+    anchors = _parse_json_str_list(env2.get("OPENCODE_FSM_HINT_ANCHORS_JSON"))
     used_anchors: list[str] = []
 
-    kind = (env2.get("AIDER_LLM_KIND") or "").strip().lower()
-    prefer_offline = _is_truthy(env2.get("AIDER_FSM_PREFER_OFFLINE_HINTS"))
-    login_shell = _is_truthy(env2.get("AIDER_FSM_HINT_LOGIN_SHELL"))
-    strict_compat = _is_truthy(env2.get("AIDER_FSM_HINT_STRICT_COMPAT", "1"))
-    require_real_score = _is_truthy(env2.get("AIDER_FSM_REQUIRE_REAL_SCORE"))
-    auto_uv_venv = _is_truthy(env2.get("AIDER_FSM_HINT_AUTO_UV", env2.get("AIDER_FSM_HINT_AUTO_UV_PY311", "1")))
-    artifacts_dir_s = str(env2.get("AIDER_FSM_ARTIFACTS_DIR") or "").strip()
+    kind = (env2.get("OPENCODE_LLM_KIND") or "").strip().lower()
+    prefer_offline = _is_truthy(env2.get("OPENCODE_FSM_PREFER_OFFLINE_HINTS"))
+    login_shell = _is_truthy(env2.get("OPENCODE_FSM_HINT_LOGIN_SHELL"))
+    strict_compat = _is_truthy(env2.get("OPENCODE_FSM_HINT_STRICT_COMPAT", "1"))
+    require_real_score = _is_truthy(env2.get("OPENCODE_FSM_REQUIRE_REAL_SCORE"))
+    auto_uv_venv = _is_truthy(env2.get("OPENCODE_FSM_HINT_AUTO_UV", env2.get("OPENCODE_FSM_HINT_AUTO_UV_PY311", "1")))
+    artifacts_dir_s = str(env2.get("OPENCODE_FSM_ARTIFACTS_DIR") or "").strip()
     artifacts_dir: Path | None = None
     if artifacts_dir_s:
         try:
@@ -187,7 +187,7 @@ def run_hints(
             artifacts_dir = None
 
     uv_py_candidates = _infer_uv_python_candidates(repo, env=env2)
-    uv_py_env_default = str(env2.get("AIDER_FSM_HINT_UV_PYTHON") or env2.get("UV_PYTHON") or "").strip()
+    uv_py_env_default = str(env2.get("OPENCODE_FSM_HINT_UV_PYTHON") or env2.get("UV_PYTHON") or "").strip()
     if not uv_py_env_default and sys.version_info >= (3, 13) and uv_py_candidates:
         uv_py_env_default = uv_py_candidates[0]
 
@@ -400,7 +400,7 @@ def run_hints(
             workdir = repo
         metrics_paths = _candidate_metrics_paths(sanitized, repo=repo, workdir=workdir if workdir != repo else None)
         if require_real_score:
-            metrics_paths.append((repo / ".aider_fsm" / "metrics.json").resolve())
+            metrics_paths.append((repo / ".opencode_fsm" / "metrics.json").resolve())
         pre_mtimes: dict[Path, float] = {}
         for p in metrics_paths:
             try:
@@ -426,7 +426,7 @@ def run_hints(
                 env3["PYTHONPATH"] = pp + (os.pathsep if pp else "") + repo_s
         if workdir != repo and looks_openai_codegen:
             try:
-                override_lim = int(str(env3.get("AIDER_EVAL_LIMIT") or "").strip() or 0)
+                override_lim = int(str(env3.get("OPENCODE_EVAL_LIMIT") or "").strip() or 0)
             except Exception:
                 override_lim = 0
             if override_lim > 0:
@@ -480,7 +480,7 @@ def run_hints(
                                     env3[override_var] = str(override_out_path)
                                 else:
                                     override_py_exec = str(
-                                        env3.get("AIDER_FSM_PYTHON") or env3.get("PYTHON") or sys.executable
+                                        env3.get("OPENCODE_FSM_PYTHON") or env3.get("PYTHON") or sys.executable
                                     ).strip() or sys.executable
                                     try:
                                         p2 = Path(override_py_exec).expanduser()
@@ -734,7 +734,7 @@ def main() -> int:
     ap.add_argument("--timeout-seconds", type=int, default=600)
     args = ap.parse_args()
 
-    repo_root = Path(os.environ.get("AIDER_FSM_REPO_ROOT") or ".").resolve()
+    repo_root = Path(os.environ.get("OPENCODE_FSM_REPO_ROOT") or ".").resolve()
     res = run_hints(repo=repo_root, max_attempts=int(args.max_attempts), timeout_seconds=int(args.timeout_seconds))
     print(json.dumps(res, ensure_ascii=False, indent=2))
     return 0 if res.get("ok") is True else 2

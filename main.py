@@ -14,18 +14,19 @@ from pathlib import Path
 
 from benchmarks.registry import get_benchmark, list_benchmarks
 from pipeline.runner import run_pipeline
+from pipeline.utils import resolve_model_path
 
 
 def _init_fsm_workspace(project_root: Path, target: Path) -> None:
-    """将项目根目录的 .aider_fsm 模板复制到运行目录，实现每次运行隔离。
+    """将项目根目录的 .opencode_fsm 模板复制到运行目录，实现每次运行隔离。
 
     复制内容：
     - stages/ 目录（rollout.sh, evaluation.sh 等模板脚本）
     - pipeline.yml（FSM 合同定义）
     - runner → runner_fsm 的符号链接
     """
-    src_fsm = project_root / ".aider_fsm"
-    dst_fsm = target / ".aider_fsm"
+    src_fsm = project_root / ".opencode_fsm"
+    dst_fsm = target / ".opencode_fsm"
 
     if not src_fsm.exists():
         return
@@ -61,6 +62,10 @@ def main():
     parser.add_argument("--max-iterations", type=int, default=5)
     parser.add_argument("--training-timeout", type=int, default=3600)
     parser.add_argument("--max-agent-steps", type=int, default=25)
+    parser.add_argument("--max-fix-retries", type=int, default=2,
+                        help="训练失败后最大修复重试次数")
+    parser.add_argument("--max-rollout-repair-retries", type=int, default=2,
+                        help="Rollout 全零 reward 时最大自动修复重试次数")
 
     parser.add_argument("--fsm-enabled", action="store_true",
                         help="启用 FSM-Runner 自动部署/rollout/评测")
@@ -90,6 +95,11 @@ def main():
     bench = get_benchmark(args.benchmark)
     data_dir = str(bench.data_dir.resolve())
 
+    # Resolve model: HF name → local cache path (download if needed)
+    model_path = os.environ.get("MODEL_PATH") or resolve_model_path(args.base_model)
+    os.environ["MODEL_PATH"] = model_path
+    print(f"  Model: {args.base_model} → {model_path}")
+
     if args.run_dir:
         run_dir = str(Path(args.run_dir).resolve())
     else:
@@ -113,7 +123,7 @@ def main():
     if not fsm_target:
         fsm_target = run_dir
 
-    # 将 .aider_fsm 模板从项目根目录复制到运行目录（隔离）
+    # 将 .opencode_fsm 模板从项目根目录复制到运行目录（隔离）
     project_root = Path(__file__).resolve().parent
     _init_fsm_workspace(project_root, Path(fsm_target))
 
@@ -148,6 +158,8 @@ def main():
         max_iterations=args.max_iterations,
         training_timeout=args.training_timeout,
         max_agent_steps=args.max_agent_steps,
+        max_fix_retries=args.max_fix_retries,
+        max_rollout_repair_retries=args.max_rollout_repair_retries,
         fsm_config=fsm_config,
     )
 

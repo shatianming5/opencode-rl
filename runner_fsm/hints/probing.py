@@ -43,7 +43,7 @@ def _hint_runtime_compatible(*, cmd: str, env: dict[str, str], strict_compat: bo
         return False, "empty"
 
     backend = _hint_backend(cmd)
-    llm_kind = str(env.get("AIDER_LLM_KIND") or "").strip().lower()
+    llm_kind = str(env.get("OPENCODE_LLM_KIND") or "").strip().lower()
     if llm_kind == "remote" and backend and backend != "openai":
         if "--samples" not in low:
             return False, f"backend_mismatch:{backend}"
@@ -167,7 +167,7 @@ def _probe_hint_command(
     py_names = {
         "python",
         "python3",
-        Path(str(env.get("AIDER_FSM_PYTHON") or "")).name.strip(),
+        Path(str(env.get("OPENCODE_FSM_PYTHON") or "")).name.strip(),
         Path(str(env.get("PYTHON") or "")).name.strip(),
     }
     py_names = {x for x in py_names if x}
@@ -176,7 +176,7 @@ def _probe_hint_command(
             module = str(tail_parts[2] or "").strip()
             if module:
                 probe_py = (
-                    str(env.get("AIDER_FSM_PYTHON") or "").strip()
+                    str(env.get("OPENCODE_FSM_PYTHON") or "").strip()
                     or str(env.get("PYTHON") or "").strip()
                     or tok
                     or "python3"

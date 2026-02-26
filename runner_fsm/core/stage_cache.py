@@ -21,7 +21,7 @@ class StageCache:
 
 
 def _cache_dir(repo: Path) -> Path:
-    return (repo / ".aider_fsm" / "cache").resolve()
+    return (repo / ".opencode_fsm" / "cache").resolve()
 
 
 def _file_hash(path: Path) -> str:
@@ -37,7 +37,7 @@ def _pipeline_hash(repo: Path) -> str:
 
 
 def _default_ttl() -> int:
-    raw = os.environ.get("AIDER_FSM_CACHE_TTL", "3600")
+    raw = os.environ.get("OPENCODE_FSM_CACHE_TTL", "3600")
     try:
         return max(0, int(str(raw).strip()))
     except Exception:
@@ -45,7 +45,7 @@ def _default_ttl() -> int:
 
 
 def _cache_globally_enabled() -> bool:
-    raw = os.environ.get("AIDER_FSM_CACHE_ENABLED", "1")
+    raw = os.environ.get("OPENCODE_FSM_CACHE_ENABLED", "1")
     return str(raw).strip().lower() in ("1", "true", "yes", "y", "on")
 
 
@@ -79,7 +79,7 @@ def load_stage_cache(repo: Path, stage_name: str) -> StageCache | None:
     if stage_name == "bootstrap":
         bootstrap_hash = extra.get("bootstrap_hash", "")
         if bootstrap_hash:
-            current_bh = _file_hash((repo / ".aider_fsm" / "bootstrap.yml").resolve())
+            current_bh = _file_hash((repo / ".opencode_fsm" / "bootstrap.yml").resolve())
             if current_bh and current_bh != bootstrap_hash:
                 return None
 

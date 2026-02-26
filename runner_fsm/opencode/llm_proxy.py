@@ -80,6 +80,49 @@ def _parse_sse_line(text: str) -> str | None:
     return None
 
 
+def _strip_encrypted(obj: dict | list, _depth: int = 0) -> bool:
+    """Recursively strip ``encrypted_content`` fields from a request payload.
+
+    OpenAI Codex models return encrypted reasoning tokens tied to a specific
+    organization.  When the conversation history is sent back through a
+    different org / Azure deployment, the server rejects them with
+    ``invalid_encrypted_content``.  Removing these fields allows multi-turn
+    conversations to work across different endpoints.
+
+    Returns True if any field was removed.
+    """
+    if _depth > 20:
+        return False
+    changed = False
+    if isinstance(obj, dict):
+        if "encrypted_content" in obj:
+            del obj["encrypted_content"]
+            changed = True
+        # Also strip reasoning items that only carry encrypted content
+        # from Responses API "input" arrays.
+        if obj.get("type") == "reasoning" and "encrypted_content" not in obj:
+            # Already stripped above; mark for removal from parent list
+            pass
+        for v in obj.values():
+            if isinstance(v, (dict, list)):
+                changed |= _strip_encrypted(v, _depth + 1)
+    elif isinstance(obj, list):
+        for item in obj:
+            if isinstance(item, (dict, list)):
+                changed |= _strip_encrypted(item, _depth + 1)
+        # Remove reasoning items that are now empty after stripping
+        before = len(obj)
+        obj[:] = [
+            item for item in obj
+            if not (isinstance(item, dict) and item.get("type") == "reasoning"
+                    and "encrypted_content" not in item
+                    and not item.get("summary"))
+        ]
+        if len(obj) != before:
+            changed = True
+    return changed
+
+
 class ProxyHandler(BaseHTTPRequestHandler):
     """Forward requests to upstream, intercept streaming responses."""
 
@@ -106,6 +149,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
             req_json = json.loads(body)
             is_stream = req_json.get("stream", False)
             model = req_json.get("model", "?")
+            # Strip encrypted_content from requests to avoid cross-org
+            # decryption failures in multi-turn conversations.
+            if _strip_encrypted(req_json):
+                body = json.dumps(req_json).encode("utf-8")
+                headers["Content-Type"] = "application/json"
         except Exception:
             model = "?"
 

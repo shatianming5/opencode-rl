@@ -6,8 +6,6 @@ import sys
 import time
 from pathlib import Path
 
-import requests
-
 from runner_fsm.opencode.client import OpenCodeClient
 
 from .prompts import build_analysis_prompt, build_code_prompt, build_fix_prompt
@@ -21,7 +19,7 @@ def phase_code_generation(
     base_model: str,
     task_description: str,
     history: list[IterationResult],
-    max_agent_steps: int = 25,
+    max_agent_steps: int = 30,
     gpu_info: dict | None = None,
     opencode_model: str = "",
     opencode_url: str = "",
@@ -59,6 +57,7 @@ def phase_code_generation(
         bash_mode="full",
         scaffold_bash_mode="full",
         unattended="strict",
+        max_turns=max_agent_steps,
         server_log_path=log_dir / f"opencode_codegen_iter{iteration}.log",
         session_title=f"code_generation_iter{iteration}",
     )
@@ -161,56 +160,6 @@ def phase_training(
     return exit_code, stdout, elapsed
 
 
-def phase_evaluation(
-    workspace: str,
-    grading_url: str,
-    pre_computed_score: float | None = None,
-) -> dict | None:
-    """Phase 3: 评测提交（pipeline 控制，非 agent）
-
-    找到 $OUTPUT_DIR 下最新模型，POST 到 Grading Server。
-    """
-    print(f"\n{'='*60}")
-    print(f"  Phase 3: Evaluation")
-    print(f"{'='*60}")
-
-    output_dir = Path(os.environ.get("OUTPUT_DIR", str(Path(workspace) / "output")))
-    if not output_dir.exists() or not any(output_dir.iterdir()):
-        print("  No model output, skipping evaluation")
-        return None
-
-    subdirs = [d for d in output_dir.iterdir() if d.is_dir() and not d.name.startswith(".")]
-    if subdirs:
-        model_path = str(max(subdirs, key=lambda d: d.stat().st_mtime))
-    else:
-        model_path = str(output_dir)
-
-    print(f"  Submitting: {model_path}")
-
-    max_retries = 2
-    for attempt in range(1, max_retries + 1):
-        try:
-            json_body = {"model_path": model_path}
-            if pre_computed_score is not None:
-                json_body["score"] = pre_computed_score
-            resp = requests.post(
-                f"{grading_url}/submit",
-                json=json_body,
-                timeout=1200,
-            )
-            result = resp.json()
-            print(f"  Score: {result.get('score')}")
-            print(f"  Improvement: {result.get('improvement')}")
-            print(f"  Best: {result.get('best', {}).get('score')}")
-            return result
-        except Exception as e:
-            print(f"  Evaluation attempt {attempt}/{max_retries} failed: {e}")
-            if attempt < max_retries:
-                print(f"  Retrying...")
-                time.sleep(5)
-    return None
-
-
 def phase_fix_training(
     code_path: str,
     error_log_path: str,
@@ -218,6 +167,7 @@ def phase_fix_training(
     workspace: str,
     opencode_model: str = "",
     opencode_url: str = "",
+    max_agent_steps: int = 30,
 ) -> None:
     """训练失败后的修复尝试，使用 OpenCodeClient。"""
     model = opencode_model or os.environ.get("OPENCODE_MODEL", "")
@@ -240,6 +190,7 @@ def phase_fix_training(
         bash_mode="full",
         scaffold_bash_mode="full",
         unattended="strict",
+        max_turns=max_agent_steps,
         server_log_path=log_dir / "opencode_fix.log",
         session_title="fix_training",
     )
@@ -273,6 +224,7 @@ def phase_analysis(
     task_description: str = "",
     opencode_model: str = "",
     opencode_url: str = "",
+    max_agent_steps: int = 30,
 ) -> str:
     """Phase 4: 自分析诊断
 
@@ -307,6 +259,7 @@ def phase_analysis(
         bash_mode="full",
         scaffold_bash_mode="full",
         unattended="strict",
+        max_turns=max_agent_steps,
         server_log_path=log_dir / f"opencode_analysis_iter{iteration}.log",
         session_title=f"analysis_iter{iteration}",
     )

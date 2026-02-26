@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-TRAINED_MODEL_PATH="${TRAINED_MODEL_PATH:-${AIDER_TRAINED_MODEL_DIR:-}}"
-RUNTIME_ENV_JSON=".aider_fsm/runtime_env.json"
-DATA_PATH="${DATA_PATH:-${AIDER_FSM_DATA_PATH:-}}"
+TRAINED_MODEL_PATH="${TRAINED_MODEL_PATH:-${OPENCODE_TRAINED_MODEL_DIR:-}}"
+RUNTIME_ENV_JSON=".opencode_fsm/runtime_env.json"
+DATA_PATH="${DATA_PATH:-${OPENCODE_FSM_DATA_PATH:-}}"
 if [ -z "$DATA_PATH" ]; then
     echo "ERROR: DATA_PATH not set" >&2
     exit 1
 fi
-OUTPUT_DIR="${AIDER_FSM_ARTIFACTS_DIR:-.aider_fsm/artifacts}"
+OUTPUT_DIR="${OPENCODE_FSM_ARTIFACTS_DIR:-.opencode_fsm/artifacts}"
 
 if [ -z "$TRAINED_MODEL_PATH" ]; then
     echo "ERROR: TRAINED_MODEL_PATH not set" >&2

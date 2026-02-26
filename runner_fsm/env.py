@@ -117,7 +117,7 @@ def _validate_rollout_samples(
 ) -> tuple[bool, str]:
     """Validate that rollout produced a usable samples JSONL reference."""
     repo = Path(repo).resolve()
-    p = (rollout_path or (repo / ".aider_fsm" / "rollout.json")).resolve()
+    p = (rollout_path or (repo / ".opencode_fsm" / "rollout.json")).resolve()
     if not p.exists():
         return False, f"missing_rollout_json: {p}"
     obj = _read_json_object(p)
@@ -302,29 +302,29 @@ def _build_overrides(session: "EnvSession", env_overrides: dict[str, str] | None
         overrides.setdefault("OPENAI_BASE_URL", base)
         overrides.setdefault("OPENAI_API_BASE", base)
 
-    overrides.setdefault("AIDER_FSM_RUN_ID", str(session.run_id))
-    overrides.setdefault("AIDER_EVAL_MODE", str(mode or "smoke").strip() or "smoke")
+    overrides.setdefault("OPENCODE_FSM_RUN_ID", str(session.run_id))
+    overrides.setdefault("OPENCODE_EVAL_MODE", str(mode or "smoke").strip() or "smoke")
 
     # Command hints
     if session.command_hints:
-        overrides.setdefault("AIDER_FSM_REQUIRE_HINTS", "1")
+        overrides.setdefault("OPENCODE_FSM_REQUIRE_HINTS", "1")
         try:
-            overrides.setdefault("AIDER_FSM_HINTS_JSON", json.dumps(list(session.command_hints[:20]), ensure_ascii=False))
+            overrides.setdefault("OPENCODE_FSM_HINTS_JSON", json.dumps(list(session.command_hints[:20]), ensure_ascii=False))
         except Exception:
-            overrides.setdefault("AIDER_FSM_HINTS_JSON", "[]")
+            overrides.setdefault("OPENCODE_FSM_HINTS_JSON", "[]")
         try:
-            overrides.setdefault("AIDER_FSM_HINT_ANCHORS_JSON", json.dumps(list(session.hint_anchors[:20]), ensure_ascii=False))
+            overrides.setdefault("OPENCODE_FSM_HINT_ANCHORS_JSON", json.dumps(list(session.hint_anchors[:20]), ensure_ascii=False))
         except Exception:
-            overrides.setdefault("AIDER_FSM_HINT_ANCHORS_JSON", "[]")
+            overrides.setdefault("OPENCODE_FSM_HINT_ANCHORS_JSON", "[]")
 
     # LLM kind / model
     if session.llm_kind:
-        overrides.setdefault("AIDER_LLM_KIND", str(session.llm_kind))
+        overrides.setdefault("OPENCODE_LLM_KIND", str(session.llm_kind))
     if session.llm_kind == "remote" and session.llm_model:
-        overrides.setdefault("AIDER_LLM_MODEL", str(session.llm_model))
+        overrides.setdefault("OPENCODE_LLM_MODEL", str(session.llm_model))
         overrides.setdefault("OPENAI_MODEL", str(session.llm_model))
     if session.trained_model_dir is not None:
-        overrides.setdefault("AIDER_TRAINED_MODEL_DIR", str(session.trained_model_dir))
+        overrides.setdefault("OPENCODE_TRAINED_MODEL_DIR", str(session.trained_model_dir))
     if session.runtime_env_path is not None:
         overrides.update(with_runtime_env_path(session.runtime_env_path))
 
@@ -332,19 +332,19 @@ def _build_overrides(session: "EnvSession", env_overrides: dict[str, str] | None
     if kind2 == "remote":
         if not session.llm_model:
             raise ValueError("missing_llm: call deploy/rollout with llm=model_id first")
-        overrides["AIDER_LLM_KIND"] = "remote"
-        overrides["AIDER_LLM_MODEL"] = str(session.llm_model)
+        overrides["OPENCODE_LLM_KIND"] = "remote"
+        overrides["OPENCODE_LLM_MODEL"] = str(session.llm_model)
         overrides.setdefault("OPENAI_MODEL", str(session.llm_model))
-        overrides.pop("AIDER_TRAINED_MODEL_DIR", None)
+        overrides.pop("OPENCODE_TRAINED_MODEL_DIR", None)
     else:
         if session.trained_model_dir is None:
             raise ValueError("missing_llm: call deploy/rollout with llm=model_dir first")
-        overrides["AIDER_LLM_KIND"] = "local_hf"
-        overrides["AIDER_TRAINED_MODEL_DIR"] = str(session.trained_model_dir)
+        overrides["OPENCODE_LLM_KIND"] = "local_hf"
+        overrides["OPENCODE_TRAINED_MODEL_DIR"] = str(session.trained_model_dir)
         model_id = str(session.trained_model_dir.name or "").strip()
         if model_id:
             overrides.setdefault("OPENAI_MODEL", model_id)
-        overrides.pop("AIDER_LLM_MODEL", None)
+        overrides.pop("OPENCODE_LLM_MODEL", None)
 
     return overrides
 
@@ -380,7 +380,7 @@ def _apply_runtime_env(session: "EnvSession", overrides: dict[str, str]) -> None
             overrides["OPENAI_BASE_URL"] = base2
     if model2:
         overrides.setdefault("OPENAI_MODEL", model2)
-        overrides.setdefault("AIDER_LLM_MODEL", model2)
+        overrides.setdefault("OPENCODE_LLM_MODEL", model2)
     if session.llm_kind == "local_hf":
         overrides.setdefault("OPENAI_API_KEY", str(overrides.get("OPENAI_API_KEY") or "local"))
 
@@ -501,7 +501,7 @@ class EnvSession:
         if artifacts_dir is not None:
             run_root = Path(str(artifacts_dir)).expanduser().resolve()
         else:
-            run_root = (self.env.repo / ".aider_fsm" / "artifacts" / str(self.run_id) / "env_api").resolve()
+            run_root = (self.env.repo / ".opencode_fsm" / "artifacts" / str(self.run_id) / "env_api").resolve()
         run_root.mkdir(parents=True, exist_ok=True)
 
         for attempt in range(int(max(0, repair_iters)) + 1):
@@ -523,7 +523,7 @@ class EnvSession:
                              deploy_dir, rollout_dir, "")
                 continue
 
-            self.runtime_env_path = deploy_res.runtime_env_path or (self.env.repo / ".aider_fsm" / "runtime_env.json").resolve()
+            self.runtime_env_path = deploy_res.runtime_env_path or (self.env.repo / ".opencode_fsm" / "runtime_env.json").resolve()
             _apply_runtime_env(self, overrides)
 
             rollout_res = _rollout(
@@ -532,7 +532,7 @@ class EnvSession:
                 use_cache=self.use_cache,
             )
             if rollout_res.ok and bool(require_samples):
-                raw_limit = overrides.get("AIDER_EVAL_LIMIT")
+                raw_limit = overrides.get("OPENCODE_EVAL_LIMIT")
                 try:
                     lim = int(str(raw_limit).strip()) if str(raw_limit or "").strip() else None
                 except Exception:
@@ -586,7 +586,7 @@ class EnvSession:
         if artifacts_dir is not None:
             run_root = Path(str(artifacts_dir)).expanduser().resolve()
         else:
-            run_root = (self.env.repo / ".aider_fsm" / "artifacts" / str(self.run_id) / "env_api").resolve()
+            run_root = (self.env.repo / ".opencode_fsm" / "artifacts" / str(self.run_id) / "env_api").resolve()
         run_root.mkdir(parents=True, exist_ok=True)
         try:
             if not self.llm_kind:
@@ -640,7 +640,7 @@ class EnvSession:
                         continue
 
                     self.runtime_env_path = (
-                        deploy_res.runtime_env_path or (self.env.repo / ".aider_fsm" / "runtime_env.json").resolve()
+                        deploy_res.runtime_env_path or (self.env.repo / ".opencode_fsm" / "runtime_env.json").resolve()
                     )
                     _apply_runtime_env(self, overrides)
 

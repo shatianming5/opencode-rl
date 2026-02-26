@@ -82,10 +82,10 @@ def repair_contract(
     context_length: int | None = None,
     max_prompt_chars: int | None = None,
 ) -> None:
-    """Ask OpenCode to repair the repo-local contract under `.aider_fsm/` (best-effort).
+    """Ask OpenCode to repair the repo-local contract under `.opencode_fsm/` (best-effort).
 
     Hard constraints are enforced in the prompt:
-    - may ONLY write `.aider_fsm/**`
+    - may ONLY write `.opencode_fsm/**`
     - may NOT modify `pipeline.yml`
     """
     artifacts_dir.mkdir(parents=True, exist_ok=True)
@@ -150,17 +150,17 @@ def repair_contract(
                         text = str(payload)
                     contract_validation = tail(text, 8000)
         # When evaluation uses `runner.generic_evaluation`, the real failure reason is typically
-        # recorded in `.aider_fsm/hints_run.json` rather than evaluation_stderr.txt.
-        hints_run_preview = _read_text_tail(repo / ".aider_fsm" / "hints_run.json", n=6000)
-        hints_used_preview = _read_text_tail(repo / ".aider_fsm" / "hints_used.json", n=3000)
-        bootstrap_preview = _read_text_tail(repo / ".aider_fsm" / "bootstrap.yml", n=3000)
-        deploy_setup_sh = _read_text_tail(repo / ".aider_fsm" / "stages" / "deploy_setup.sh", n=4000)
-        deploy_health_sh = _read_text_tail(repo / ".aider_fsm" / "stages" / "deploy_health.sh", n=2000)
-        deploy_teardown_sh = _read_text_tail(repo / ".aider_fsm" / "stages" / "deploy_teardown.sh", n=2000)
-        rollout_sh = _read_text_tail(repo / ".aider_fsm" / "stages" / "rollout.sh", n=4000)
-        evaluation_sh = _read_text_tail(repo / ".aider_fsm" / "stages" / "evaluation.sh", n=4000)
-        runtime_env_preview = _read_text_tail(repo / ".aider_fsm" / "runtime_env.json", n=2000)
-        metrics_preview = _read_text_tail(repo / ".aider_fsm" / "metrics.json", n=2000)
+        # recorded in `.opencode_fsm/hints_run.json` rather than evaluation_stderr.txt.
+        hints_run_preview = _read_text_tail(repo / ".opencode_fsm" / "hints_run.json", n=6000)
+        hints_used_preview = _read_text_tail(repo / ".opencode_fsm" / "hints_used.json", n=3000)
+        bootstrap_preview = _read_text_tail(repo / ".opencode_fsm" / "bootstrap.yml", n=3000)
+        deploy_setup_sh = _read_text_tail(repo / ".opencode_fsm" / "stages" / "deploy_setup.sh", n=4000)
+        deploy_health_sh = _read_text_tail(repo / ".opencode_fsm" / "stages" / "deploy_health.sh", n=2000)
+        deploy_teardown_sh = _read_text_tail(repo / ".opencode_fsm" / "stages" / "deploy_teardown.sh", n=2000)
+        rollout_sh = _read_text_tail(repo / ".opencode_fsm" / "stages" / "rollout.sh", n=4000)
+        evaluation_sh = _read_text_tail(repo / ".opencode_fsm" / "stages" / "evaluation.sh", n=4000)
+        runtime_env_preview = _read_text_tail(repo / ".opencode_fsm" / "runtime_env.json", n=2000)
+        metrics_preview = _read_text_tail(repo / ".opencode_fsm" / "metrics.json", n=2000)
         extra = str(extra_context or "").strip()
         extra_block = f"\n[EXTRA_CONTEXT]\n{extra}\n" if extra else ""
         hints = [str(s).strip() for s in (command_hints or []) if str(s).strip()]
@@ -191,56 +191,56 @@ def repair_contract(
             "  - Bash:  <bash command=\"...\" description=\"...\" />\n"
             "\n"
             "Hard constraints:\n"
-            "1) You may ONLY write files under `.aider_fsm/`.\n"
+            "1) You may ONLY write files under `.opencode_fsm/`.\n"
             "2) Do NOT modify `pipeline.yml`.\n"
             "3) Keep everything non-interactive (assume unattended strict).\n"
             "4) Do NOT use `sed -i` (not portable).\n"
             "5) If you embed python via heredoc, do NOT rely on sys.argv and NEVER put shell args after the heredoc terminator.\n"
-            "6) If you need Python, you MUST use `$AIDER_FSM_PYTHON` (preferred) or `python3`. Do NOT call `python`.\n"
+            "6) If you need Python, you MUST use `$OPENCODE_FSM_PYTHON` (preferred) or `python3`. Do NOT call `python`.\n"
             "7) Do NOT use `&>/dev/null` (it is prone to escaping/corruption). Use `>/dev/null 2>&1` or `2>/dev/null`.\n"
-            "8) Do NOT delete `.aider_fsm/artifacts/**` (keep evidence).\n"
-            "   Avoid deleting/rewriting an existing `.aider_fsm/venv/**`.\n"
+            "8) Do NOT delete `.opencode_fsm/artifacts/**` (keep evidence).\n"
+            "   Avoid deleting/rewriting an existing `.opencode_fsm/venv/**`.\n"
             "   If you need a different Python version (e.g. deps don't have wheels for the current Python),\n"
-            "   create a NEW venv directory like `.aider_fsm/venv_py311` and repoint PATH + AIDER_FSM_PYTHON.\n"
+            "   create a NEW venv directory like `.opencode_fsm/venv_py311` and repoint PATH + OPENCODE_FSM_PYTHON.\n"
             "\n"
             "Contract requirements:\n"
-            "- deploy must write `.aider_fsm/runtime_env.json` (JSON object)\n"
-            "- rollout must write `.aider_fsm/rollout.json` (JSON object)\n"
-            "- evaluation must write `.aider_fsm/metrics.json` (JSON object, must contain keys `ok` and `score`; require `ok=true` for success)\n"
+            "- deploy must write `.opencode_fsm/runtime_env.json` (JSON object)\n"
+            "- rollout must write `.opencode_fsm/rollout.json` (JSON object)\n"
+            "- evaluation must write `.opencode_fsm/metrics.json` (JSON object, must contain keys `ok` and `score`; require `ok=true` for success)\n"
             "  `metrics.json.ok` MUST be a JSON boolean true/false. Do NOT write 1/0 and do NOT write a string.\n"
             "- If command hints exist (see [CANDIDATE_COMMAND_HINTS]), evaluation MUST run at least one hinted/official command.\n"
-            "  Additionally, when `AIDER_FSM_REQUIRE_HINTS=1`, evaluation MUST write `.aider_fsm/hints_used.json` with:\n"
+            "  Additionally, when `OPENCODE_FSM_REQUIRE_HINTS=1`, evaluation MUST write `.opencode_fsm/hints_used.json` with:\n"
             "    - `ok`: boolean (true only if a hinted/official command succeeded)\n"
-            "    - `used_anchors`: list[string] (must include at least one token from `AIDER_FSM_HINT_ANCHORS_JSON`)\n"
+            "    - `used_anchors`: list[string] (must include at least one token from `OPENCODE_FSM_HINT_ANCHORS_JSON`)\n"
             "    - `commands`: list[string] (recommended; attempted commands)\n"
             "    - `reason`: string (required when ok=false)\n"
             "  If no hinted/official command can run, set ok=false with a clear reason and EXIT NON-ZERO.\n"
             "- Preferred benchmark-agnostic evaluation implementation: call the built-in helper in evaluation.sh:\n"
-            "    `$AIDER_FSM_PYTHON \"$AIDER_FSM_RUNNER_ROOT/runner/generic_evaluation.py\"`\n"
+            "    `$OPENCODE_FSM_PYTHON \"$OPENCODE_FSM_RUNNER_ROOT/runner/generic_evaluation.py\"`\n"
             "  IMPORTANT: this helper script does NOT take CLI flags; it reads inputs from env vars only. Do NOT pass `--runtime-env`/`--metrics-json` etc.\n"
-            "  IMPORTANT: the helper scripts live under `$AIDER_FSM_RUNNER_ROOT/runner/` (do NOT reference `$AIDER_FSM_RUNNER_ROOT/.aider_fsm/...`).\n"
-            "  It already executes `AIDER_FSM_HINTS_JSON` safely, writes `hints_used.json` + `metrics.json`, and exits non-zero when required hints fail.\n"
+            "  IMPORTANT: the helper scripts live under `$OPENCODE_FSM_RUNNER_ROOT/runner/` (do NOT reference `$OPENCODE_FSM_RUNNER_ROOT/.opencode_fsm/...`).\n"
+            "  It already executes `OPENCODE_FSM_HINTS_JSON` safely, writes `hints_used.json` + `metrics.json`, and exits non-zero when required hints fail.\n"
             "  Do NOT hand-roll JSON parsing of hint env vars (easy to get wrong).\n"
-            "  CRITICAL: do NOT generate `.aider_fsm/hints_used.json` manually (no hardcoded anchors, no copying anchors from env).\n"
+            "  CRITICAL: do NOT generate `.opencode_fsm/hints_used.json` manually (no hardcoded anchors, no copying anchors from env).\n"
             "  If you see failures like `hints_used.no_expected_anchor` or audit errors like\n"
             "  `evaluation.sh does not appear to use any doc-derived benchmark/eval command hint anchors`,\n"
             "  the fix is to call the helper above so the runner can verify real hint execution.\n"
             "- If hinted/official commands fail due to missing deps, import errors, or version mismatches, DO NOT fake success.\n"
-            "  Instead, add `.aider_fsm/bootstrap.yml` to set up an isolated environment (e.g., venv) and install repo deps deterministically,\n"
+            "  Instead, add `.opencode_fsm/bootstrap.yml` to set up an isolated environment (e.g., venv) and install repo deps deterministically,\n"
             "  then ensure evaluation runs the hinted command within that environment.\n"
             "  IMPORTANT: bootstrap.yml is for **environment preparation only**. Do NOT run evaluation/test/benchmark commands in bootstrap\n"
             "  (e.g. do NOT run `pytest`, benchmark CLI entrypoints, or `make test`). Those belong in the stage scripts (especially evaluation.sh).\n"
-            "  IMPORTANT: if you create a venv, all installs MUST use the venv interpreter (`.aider_fsm/venv/bin/python -m pip ...`),\n"
+            "  IMPORTANT: if you create a venv, all installs MUST use the venv interpreter (`.opencode_fsm/venv/bin/python -m pip ...`),\n"
             "  not the system `python3 -m pip ...` (do not pollute global/user site-packages).\n"
             "  Example bootstrap.yml pattern:\n"
             "    version: 1\n"
             "    cmds:\n"
             "      - uv python install 3.11\n"
-            "      - uv venv --python 3.11 .aider_fsm/venv_py311\n"
-            "      - uv pip install --python .aider_fsm/venv_py311/bin/python -e .\n"
+            "      - uv venv --python 3.11 .opencode_fsm/venv_py311\n"
+            "      - uv pip install --python .opencode_fsm/venv_py311/bin/python -e .\n"
             "    env:\n"
-            "      PATH: \".aider_fsm/venv_py311/bin:$PATH\"\n"
-            "      AIDER_FSM_PYTHON: \".aider_fsm/venv_py311/bin/python\"\n"
+            "      PATH: \".opencode_fsm/venv_py311/bin:$PATH\"\n"
+            "      OPENCODE_FSM_PYTHON: \".opencode_fsm/venv_py311/bin/python\"\n"
             "  If (and only if) you see a tree-sitter language/version mismatch error,\n"
             "  fix it in bootstrap.yml by pinning compatible versions in the venv before running the hinted command.\n"
             "  Prefer versions that have wheels for your Python version; avoid source builds when possible.\n"
@@ -248,8 +248,8 @@ def repair_contract(
             "  Either remove the unnecessary dependency, install without pinning, or pick a version that actually exists (pip often prints a list).\n"
             "- NEVER set `ok=true` unless the evaluation actually ran and succeeded.\n"
             "- NEVER hardcode a non-zero score. Derive the score from real execution outputs.\n"
-            "- NOTE: the runner audits `.aider_fsm/stages/evaluation.sh` and will reject hardcoded non-zero scores and proxy/no-op evaluations.\n"
-            "- rollout MUST also write a samples JSONL file under `$AIDER_FSM_ARTIFACTS_DIR` and include its path in `rollout.json.paths.samples_jsonl`.\n"
+            "- NOTE: the runner audits `.opencode_fsm/stages/evaluation.sh` and will reject hardcoded non-zero scores and proxy/no-op evaluations.\n"
+            "- rollout MUST also write a samples JSONL file under `$OPENCODE_FSM_ARTIFACTS_DIR` and include its path in `rollout.json.paths.samples_jsonl`.\n"
             "  Each JSONL line must be an object with keys: `prompt` (string), `completion` (string), `reward` (number).\n"
             "  At least one sample line MUST have a non-empty `completion` (non-whitespace), or the rollout contract will fail.\n"
             "- IMPORTANT: if [EXTRA_CONTEXT] mentions `hf_qa_samples_too_few` OR `hf_qa_prompts_not_anchored`, this target is an HF QA snapshot.\n"
@@ -257,24 +257,24 @@ def repair_contract(
             "  - generate at least N valid samples if N is specified (and have prompt diversity)\n"
             "  - anchor prompts to the HF test parquet questions (i.e., include the real question text; do NOT synthesize unrelated tasks)\n"
             "  In this case, do NOT hand-roll placeholder sample generators.\n"
-            "  Preferred benchmark-agnostic fix: call the built-in helper (recommended): `$AIDER_FSM_PYTHON \"$AIDER_FSM_RUNNER_ROOT/runner/generic_rollout.py\"`.\n"
+            "  Preferred benchmark-agnostic fix: call the built-in helper (recommended): `$OPENCODE_FSM_PYTHON \"$OPENCODE_FSM_RUNNER_ROOT/runner/generic_rollout.py\"`.\n"
             "  IMPORTANT: this helper script does NOT take CLI flags; it reads inputs from env vars only.\n"
-            "  It already handles HF QA snapshots and respects `AIDER_EVAL_MODE` / `AIDER_EVAL_LIMIT`.\n"
+            "  It already handles HF QA snapshots and respects `OPENCODE_EVAL_MODE` / `OPENCODE_EVAL_LIMIT`.\n"
             "- If a hinted/official command fails due to permission errors writing outputs (e.g., cannot create a results directory),\n"
-            "  redirect its outputs to a writable location under `$AIDER_FSM_ARTIFACTS_DIR` (or `.aider_fsm/`).\n"
+            "  redirect its outputs to a writable location under `$OPENCODE_FSM_ARTIFACTS_DIR` (or `.opencode_fsm/`).\n"
             "  Prefer passing an explicit output flag (common names: `--output`, `--output_file`, `--out`, `--out_dir`, `--root`) rather than relying on tool defaults.\n"
-            "- scripts MUST support `AIDER_RUNTIME_ENV_PATH` and local/remote inference inputs (`AIDER_TRAINED_MODEL_DIR` OR `AIDER_LLM_KIND=remote` + `AIDER_LLM_MODEL`, with endpoint/auth from env like `OPENAI_API_KEY`).\n"
+            "- scripts MUST support `OPENCODE_RUNTIME_ENV_PATH` and local/remote inference inputs (`OPENCODE_TRAINED_MODEL_DIR` OR `OPENCODE_LLM_KIND=remote` + `OPENCODE_LLM_MODEL`, with endpoint/auth from env like `OPENAI_API_KEY`).\n"
             "- If you use an OpenAI-compatible client library that requires an API key, DO NOT embed secrets in files. Instead, read it from env (e.g. OPENAI_API_KEY) and fail clearly if missing.\n"
             "- deploy_teardown should stop any started services/containers (best-effort)\n"
             "\n"
             "[LLM_RUNTIME]\n"
-            f"AIDER_LLM_KIND: {str(llm_kind or '')}\n"
-            f"AIDER_LLM_MODEL: {str(llm_model or '')}\n"
+            f"OPENCODE_LLM_KIND: {str(llm_kind or '')}\n"
+            f"OPENCODE_LLM_MODEL: {str(llm_model or '')}\n"
             "\n"
             "NOTE:\n"
-            "- If `AIDER_LLM_KIND=remote`, deploy MUST NOT require a local server. It should write runtime_env.json with `inference.type=openai_compat`\n"
+            "- If `OPENCODE_LLM_KIND=remote`, deploy MUST NOT require a local server. It should write runtime_env.json with `inference.type=openai_compat`\n"
             "  and pass health checks without server.pid.\n"
-            "- If `AIDER_LLM_KIND=local_hf`, deploy may start a local OpenAI-compatible server and record its base_url + pid.\n"
+            "- If `OPENCODE_LLM_KIND=local_hf`, deploy may start a local OpenAI-compatible server and record its base_url + pid.\n"
             "\n"
             f"FAILED_STAGE: {failed_stage}\n"
             f"REPO_ROOT: {repo}\n"
@@ -337,12 +337,12 @@ def repair_contract(
             f"{metrics_preview}\n"
             f"{extra_block}"
             "\n"
-            "Now: inspect `.aider_fsm/stages/*.sh` and fix the scripts so the contract passes.\n"
+            "Now: inspect `.opencode_fsm/stages/*.sh` and fix the scripts so the contract passes.\n"
         )
         try:
             res = agent.run(prompt, fsm_state="S_REPAIR", iter_idx=0, purpose="repair_contract")
             tool_trace = [dict(x) for x in (res.tool_trace or []) if isinstance(x, dict)]
-            # The agent may mutate `.aider_fsm/**` (including artifacts); keep runner reporting best-effort.
+            # The agent may mutate `.opencode_fsm/**` (including artifacts); keep runner reporting best-effort.
             try:
                 artifacts_dir.mkdir(parents=True, exist_ok=True)
             except Exception:

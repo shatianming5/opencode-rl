@@ -31,7 +31,7 @@ class ScaffoldValidationReport:
 
 _BOOTSTRAP_STAGE_CMD_RE = re.compile(
     r"(?i)(^|\s)(pytest|nose2?|tox|make\s+test|runner\.generic_evaluation|"
-    r"\.aider_fsm/stages/(evaluation|rollout)\.sh)\b"
+    r"\.opencode_fsm/stages/(evaluation|rollout)\.sh)\b"
 )
 
 def validate_scaffolded_pipeline(
@@ -67,13 +67,13 @@ def validate_scaffolded_pipeline(
 def validate_scaffolded_files(repo_root: Path) -> list[str]:
     repo_root = Path(repo_root).resolve()
     required = [
-        repo_root / ".aider_fsm" / "stages" / "tests.sh",
-        repo_root / ".aider_fsm" / "stages" / "deploy_setup.sh",
-        repo_root / ".aider_fsm" / "stages" / "deploy_health.sh",
-        repo_root / ".aider_fsm" / "stages" / "deploy_teardown.sh",
-        repo_root / ".aider_fsm" / "stages" / "rollout.sh",
-        repo_root / ".aider_fsm" / "stages" / "evaluation.sh",
-        repo_root / ".aider_fsm" / "stages" / "benchmark.sh",
+        repo_root / ".opencode_fsm" / "stages" / "tests.sh",
+        repo_root / ".opencode_fsm" / "stages" / "deploy_setup.sh",
+        repo_root / ".opencode_fsm" / "stages" / "deploy_health.sh",
+        repo_root / ".opencode_fsm" / "stages" / "deploy_teardown.sh",
+        repo_root / ".opencode_fsm" / "stages" / "rollout.sh",
+        repo_root / ".opencode_fsm" / "stages" / "evaluation.sh",
+        repo_root / ".opencode_fsm" / "stages" / "benchmark.sh",
     ]
     missing: list[str] = []
     for p in required:
@@ -85,13 +85,13 @@ def validate_scaffolded_stage_scripts(repo_root: Path) -> list[str]:
     """Best-effort stage script lint: currently shell syntax checks for required scripts."""
     repo_root = Path(repo_root).resolve()
     required = [
-        repo_root / ".aider_fsm" / "stages" / "tests.sh",
-        repo_root / ".aider_fsm" / "stages" / "deploy_setup.sh",
-        repo_root / ".aider_fsm" / "stages" / "deploy_health.sh",
-        repo_root / ".aider_fsm" / "stages" / "deploy_teardown.sh",
-        repo_root / ".aider_fsm" / "stages" / "rollout.sh",
-        repo_root / ".aider_fsm" / "stages" / "evaluation.sh",
-        repo_root / ".aider_fsm" / "stages" / "benchmark.sh",
+        repo_root / ".opencode_fsm" / "stages" / "tests.sh",
+        repo_root / ".opencode_fsm" / "stages" / "deploy_setup.sh",
+        repo_root / ".opencode_fsm" / "stages" / "deploy_health.sh",
+        repo_root / ".opencode_fsm" / "stages" / "deploy_teardown.sh",
+        repo_root / ".opencode_fsm" / "stages" / "rollout.sh",
+        repo_root / ".opencode_fsm" / "stages" / "evaluation.sh",
+        repo_root / ".opencode_fsm" / "stages" / "benchmark.sh",
     ]
     issues: list[str] = []
     for p in required:
@@ -122,7 +122,7 @@ def validate_scaffolded_stage_scripts(repo_root: Path) -> list[str]:
 
     # Additional semantic audits for evaluation.sh: we want to reject obvious proxy
     # contracts early so OpenCode retries before expensive deploy/rollout runs.
-    eval_sh = (repo_root / ".aider_fsm" / "stages" / "evaluation.sh").resolve()
+    eval_sh = (repo_root / ".opencode_fsm" / "stages" / "evaluation.sh").resolve()
     if eval_sh.exists():
         try:
             hardcoded = audit_eval_script_for_hardcoded_nonzero_score(repo_root)
@@ -139,7 +139,7 @@ def validate_scaffolded_stage_scripts(repo_root: Path) -> list[str]:
                 msg = str(no_exec).strip()
                 if len(msg) > 500:
                     msg = msg[:500] + "..."
-                issues.append(f".aider_fsm/stages/evaluation.sh:{msg}")
+                issues.append(f".opencode_fsm/stages/evaluation.sh:{msg}")
         except Exception:
             pass
         try:
@@ -152,17 +152,17 @@ def validate_scaffolded_stage_scripts(repo_root: Path) -> list[str]:
                     and "hints_used.json" not in low
                 ):
                     issues.append(
-                        ".aider_fsm/stages/evaluation.sh:missing_hints_provenance: "
-                        "when repo hints exist, evaluation should call generic_evaluation.py or write .aider_fsm/hints_used.json"
+                        ".opencode_fsm/stages/evaluation.sh:missing_hints_provenance: "
+                        "when repo hints exist, evaluation should call generic_evaluation.py or write .opencode_fsm/hints_used.json"
                     )
         except Exception:
             pass
     return issues
 
 def validate_scaffolded_bootstrap(repo_root: Path) -> tuple[list[str], list[str]]:
-    """Validate optional `.aider_fsm/bootstrap.yml` parseability + basic contract hints."""
+    """Validate optional `.opencode_fsm/bootstrap.yml` parseability + basic contract hints."""
     repo_root = Path(repo_root).resolve()
-    path = (repo_root / ".aider_fsm" / "bootstrap.yml").resolve()
+    path = (repo_root / ".opencode_fsm" / "bootstrap.yml").resolve()
     if not path.exists():
         return [], []
     errors: list[str] = []

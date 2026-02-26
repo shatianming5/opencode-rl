@@ -39,23 +39,23 @@ def _normalize_bootstrap_applied_env_paths(repo: Path, applied_env: dict[str, st
 
     Why this exists:
     - Many scaffolded `bootstrap.yml` files set values like:
-      - `PATH: ".aider_fsm/venv/bin:$PATH"`
-      - `AIDER_FSM_PYTHON: ".aider_fsm/venv/bin/python"`
+      - `PATH: ".opencode_fsm/venv/bin:$PATH"`
+      - `OPENCODE_FSM_PYTHON: ".opencode_fsm/venv/bin/python"`
     - Some stages (notably `runner.hints_exec`) may execute commands from an isolated
-      workdir under `$AIDER_FSM_ARTIFACTS_DIR`, where relative PATH segments would
+      workdir under `$OPENCODE_FSM_ARTIFACTS_DIR`, where relative PATH segments would
       no longer resolve to the repo's venv.
     """
     root = Path(repo).resolve()
     out = dict(applied_env or {})
 
-    py = str(out.get("AIDER_FSM_PYTHON") or "").strip()
+    py = str(out.get("OPENCODE_FSM_PYTHON") or "").strip()
     if py:
         try:
             p = Path(py)
             if not p.is_absolute():
                 # Do not use `.resolve()` here: venv interpreters are often symlinks to the
                 # base interpreter, and resolving the symlink breaks venv isolation.
-                out["AIDER_FSM_PYTHON"] = str((root / p).absolute())
+                out["OPENCODE_FSM_PYTHON"] = str((root / p).absolute())
         except Exception:
             pass
 
@@ -274,7 +274,7 @@ def run_bootstrap(
 
     # Seed commonly-used variables for env expansion.
     env_base = dict(os.environ)
-    env_base["AIDER_FSM_REPO_ROOT"] = str(repo.resolve())
+    env_base["OPENCODE_FSM_REPO_ROOT"] = str(repo.resolve())
 
     env_for_cmds = dict(env_base)
     applied_env: dict[str, str] = {}
@@ -293,9 +293,9 @@ def run_bootstrap(
     applied_env = _normalize_bootstrap_applied_env_paths(repo, applied_env)
     env_for_cmds.update(dict(applied_env))
     env_for_cmds = safe_env(env_for_cmds, {}, unattended=unattended)
-    env_for_cmds["AIDER_FSM_STAGE"] = "bootstrap"
-    env_for_cmds["AIDER_FSM_ARTIFACTS_DIR"] = str(artifacts_dir.resolve())
-    env_for_cmds["AIDER_FSM_REPO_ROOT"] = str(repo.resolve())
+    env_for_cmds["OPENCODE_FSM_STAGE"] = "bootstrap"
+    env_for_cmds["OPENCODE_FSM_ARTIFACTS_DIR"] = str(artifacts_dir.resolve())
+    env_for_cmds["OPENCODE_FSM_REPO_ROOT"] = str(repo.resolve())
     redacted: dict[str, str] = {}
     for k, v in (applied_env or {}).items():
         ku = str(k or "").upper()

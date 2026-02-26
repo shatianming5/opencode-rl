@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-RUNTIME_ENV_JSON=".aider_fsm/runtime_env.json"
+RUNTIME_ENV_JSON=".opencode_fsm/runtime_env.json"
 
 if [ ! -f "$RUNTIME_ENV_JSON" ]; then
     echo "ERROR: runtime_env.json not found" >&2

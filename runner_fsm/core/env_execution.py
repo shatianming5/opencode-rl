@@ -37,7 +37,7 @@ def _run_with_bootstrap(
     use_cache: bool = False,
 ) -> VerificationResult:
     """Run pipeline verification, optionally preceded by bootstrap."""
-    bootstrap_path = (env.repo / ".aider_fsm" / "bootstrap.yml").resolve()
+    bootstrap_path = (env.repo / ".opencode_fsm" / "bootstrap.yml").resolve()
     if run_bootstrap_first and bootstrap_path.exists():
         applied_env: dict[str, str] | None = None
         bootstrap_stage = None
@@ -156,7 +156,7 @@ def _run_deploy_health_check(env: EnvHandle, pipeline: PipelineSpec, artifacts_d
     """Execute deploy_health_cmds to verify a cached deploy is still alive."""
     if not pipeline.deploy_health_cmds:
         return True
-    skip = os.environ.get("AIDER_FSM_CACHE_SKIP_HEALTH", "0")
+    skip = os.environ.get("OPENCODE_FSM_CACHE_SKIP_HEALTH", "0")
     if str(skip).strip().lower() in ("1", "true", "yes"):
         return True
     health_pipeline = _stage_only_pipeline(
@@ -202,7 +202,7 @@ def rollout(
     verify = _run_with_bootstrap(env, p, artifacts_dir=artifacts_dir, unattended=unattended, run_bootstrap_first=run_bootstrap_first, use_cache=use_cache)
     if verify.failed_stage == "bootstrap":
         return RolloutCallResult(ok=False, artifacts_dir=artifacts_dir, rollout_path=None, verify=verify)
-    rollout_path = (env.repo / ".aider_fsm" / "rollout.json").resolve()
+    rollout_path = (env.repo / ".opencode_fsm" / "rollout.json").resolve()
     if not rollout_path.exists():
         rollout_path = None
     ok = bool(verify.ok)
@@ -253,7 +253,7 @@ def rollout_and_evaluate(
             EvaluationCallResult(ok=False, artifacts_dir=artifacts_dir, metrics_path=None, metrics=None, verify=verify),
         )
 
-    rollout_path = (env.repo / ".aider_fsm" / "rollout.json").resolve()
+    rollout_path = (env.repo / ".opencode_fsm" / "rollout.json").resolve()
     if not rollout_path.exists():
         rollout_path = None
     metrics_path = Path(str(verify.metrics_path)).resolve() if getattr(verify, "metrics_path", None) else None
@@ -276,7 +276,7 @@ def with_env_vars(extra_env: dict[str, str]) -> dict[str, str]:
 
 def with_runtime_env_path(runtime_env_path: str | Path) -> dict[str, str]:
     p = Path(str(runtime_env_path)).expanduser().resolve()
-    return _merge_env({}, {"AIDER_RUNTIME_ENV_PATH": str(p)})
+    return _merge_env({}, {"OPENCODE_RUNTIME_ENV_PATH": str(p)})
 
 
 def deploy(
@@ -286,7 +286,7 @@ def deploy(
     env_overrides: dict[str, str] | None = None,
     unattended: str = "strict",
     run_bootstrap_first: bool = True,
-    runtime_env_rel: str = ".aider_fsm/runtime_env.json",
+    runtime_env_rel: str = ".opencode_fsm/runtime_env.json",
     use_cache: bool = False,
 ) -> DeployCallResult:
     artifacts_dir = (artifacts_dir or _default_artifacts_dir(env.repo, prefix="deploy")).resolve()

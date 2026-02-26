@@ -26,8 +26,8 @@ def snapshot_contract_files(repo: Path) -> dict[str, dict[str, Any]]:
             "size": len(data),
             "sha256": hashlib.sha256(data).hexdigest(),
         }
-    aider = (root / ".aider_fsm").resolve()
-    if aider.exists():
+    fsm_dir = (root / ".opencode_fsm").resolve()
+    if fsm_dir.exists():
         # Single-file contract inputs/outputs.
         for rel in (
             "bootstrap.yml",
@@ -37,7 +37,7 @@ def snapshot_contract_files(repo: Path) -> dict[str, dict[str, Any]]:
             "hints_used.json",
             "hints_run.json",
         ):
-            p = (aider / rel).resolve()
+            p = (fsm_dir / rel).resolve()
             if p.exists() and p.is_file():
                 try:
                     data = p.read_bytes()
@@ -51,7 +51,7 @@ def snapshot_contract_files(repo: Path) -> dict[str, dict[str, Any]]:
                     }
 
         # Stage scripts are the main contract surface.
-        stages = (aider / "stages").resolve()
+        stages = (fsm_dir / "stages").resolve()
         if stages.exists():
             for p in sorted(stages.rglob("*")):
                 if not p.is_file():

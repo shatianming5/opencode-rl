@@ -17,10 +17,6 @@ def get_llm_base_url() -> str:
     return os.environ.get("LLM_BASE_URL") or os.environ.get("OPENAI_API_BASE", "")
 
 
-def get_grading_server_url() -> str:
-    return os.environ.get("GRADING_SERVER_URL", "http://localhost:5000")
-
-
 def get_fsm_enabled() -> bool:
     return os.environ.get("FSM_ENABLED", "").lower() in ("1", "true", "yes")
 

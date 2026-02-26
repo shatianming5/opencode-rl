@@ -9,7 +9,7 @@ def audit_eval_script_for_hardcoded_nonzero_score(repo: Path) -> str | None:
     We cannot fully prove "real benchmark execution", but we can block a common
     failure mode: writing a constant non-zero score into metrics.json.
     """
-    p = (Path(repo).resolve() / ".aider_fsm" / "stages" / "evaluation.sh").resolve()
+    p = (Path(repo).resolve() / ".opencode_fsm" / "stages" / "evaluation.sh").resolve()
     if not p.exists():
         return None
     try:
@@ -35,7 +35,7 @@ def audit_eval_script_for_hardcoded_nonzero_score(repo: Path) -> str | None:
             break
     if not bad:
         return None
-    return "hardcoded_nonzero_score_in_.aider_fsm/stages/evaluation.sh:\n" + "\n".join(bad)
+    return "hardcoded_nonzero_score_in_.opencode_fsm/stages/evaluation.sh:\n" + "\n".join(bad)
 
 def audit_eval_script_has_real_execution(repo: Path, *, extra_markers: list[str] | None = None) -> str | None:
     """Heuristic: evaluation.sh should *run* something beyond writing JSON.
@@ -43,7 +43,7 @@ def audit_eval_script_has_real_execution(repo: Path, *, extra_markers: list[str]
     The check is benchmark-agnostic and only looks for high-signal "execution markers"
     or doc-derived anchors.
     """
-    p = (Path(repo).resolve() / ".aider_fsm" / "stages" / "evaluation.sh").resolve()
+    p = (Path(repo).resolve() / ".opencode_fsm" / "stages" / "evaluation.sh").resolve()
     if not p.exists():
         return None
     try:
@@ -102,9 +102,9 @@ def audit_eval_script_has_real_execution(repo: Path, *, extra_markers: list[str]
             #   python3 - <<PY
             if "<<" in s:
                 if "<<" in s and ("<<py" in s or "<<-py" in s or "<<\tpy" in s or "<< 'py'" in s or "<<'py'" in s):
-                    if "python" in s or "$py" in s or "$aider_fsm_python" in s:
+                    if "python" in s or "$py" in s or "$opencode_fsm_python" in s:
                         return None
-            # Accept `$AIDER_FSM_PYTHON` and also wrapper vars like `$PYTHON`.
+            # Accept `$OPENCODE_FSM_PYTHON` and also wrapper vars like `$PYTHON`.
             if s.startswith("$") or s.startswith("python3") or s.startswith("python"):
                 if " -m " in s:
                     return None
@@ -124,7 +124,7 @@ def audit_eval_script_mentions_any_anchor(repo: Path, anchors: list[str]) -> str
     anchors2 = [str(a).strip().lower() for a in (anchors or []) if str(a).strip()]
     if not anchors2:
         return None
-    p = (Path(repo).resolve() / ".aider_fsm" / "stages" / "evaluation.sh").resolve()
+    p = (Path(repo).resolve() / ".opencode_fsm" / "stages" / "evaluation.sh").resolve()
     if not p.exists():
         return None
     try:
@@ -138,7 +138,7 @@ def audit_eval_script_mentions_any_anchor(repo: Path, anchors: list[str]) -> str
         return None
     # Also accept the script-path invocation form which avoids `runner` module name
     # collisions with target repos that contain their own `runner/` package.
-    if "aider_fsm_runner_root" in low_all and "generic_evaluation.py" in low_all:
+    if "opencode_fsm_runner_root" in low_all and "generic_evaluation.py" in low_all:
         return None
 
     non_exec_prefixes = (

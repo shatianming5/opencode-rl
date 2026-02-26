@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-ROLLOUT_JSON=".aider_fsm/rollout.json"
+ROLLOUT_JSON=".opencode_fsm/rollout.json"
 if [ ! -f "$ROLLOUT_JSON" ]; then
     echo "Error: rollout.json not found at $ROLLOUT_JSON"
     exit 1
@@ -10,11 +10,11 @@ fi
 SAMPLES_JSONL=$(jq -r '.samples_jsonl // .paths.samples_jsonl' "$ROLLOUT_JSON")
 echo "Evaluating samples from $SAMPLES_JSONL"
 
-${AIDER_FSM_PYTHON:-python3} << 'PYTHON_SCRIPT'
+${OPENCODE_FSM_PYTHON:-python3} << 'PYTHON_SCRIPT'
 import json
 import os
 
-with open('.aider_fsm/rollout.json', 'r') as f:
+with open('.opencode_fsm/rollout.json', 'r') as f:
     rollout_info = json.load(f)
 
 samples_jsonl = rollout_info.get('samples_jsonl') or rollout_info.get('paths', {}).get('samples_jsonl', '')
@@ -45,10 +45,10 @@ metrics = {
     "total": len(samples)
 }
 
-with open('.aider_fsm/metrics.json', 'w') as f:
+with open('.opencode_fsm/metrics.json', 'w') as f:
     json.dump(metrics, f, indent=2)
 
-print("Metrics written to .aider_fsm/metrics.json")
+print("Metrics written to .opencode_fsm/metrics.json")
 print(json.dumps(metrics, indent=2))
 PYTHON_SCRIPT
 

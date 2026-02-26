@@ -17,7 +17,7 @@ from urllib.request import Request, urlopen
 _OWNER_REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 _GITHUB_ARCHIVE_HOSTS = {"github.com", "www.github.com"}
 _HF_HOSTS = {"huggingface.co", "www.huggingface.co"}
-_PREFERRED_CLONES_BASE = Path("/data/tiansha/aider_fsm_targets")
+_PREFERRED_CLONES_BASE = Path("/data/tiansha/opencode_fsm_targets")
 
 def is_probably_repo_url(repo: str) -> bool:
     s = str(repo or "").strip()
@@ -124,8 +124,8 @@ def _download_hf_dataset_snapshot(
     if not isinstance(siblings, list):
         siblings = []
 
-    max_total_bytes = int(os.environ.get("AIDER_FSM_HF_MAX_TOTAL_BYTES") or 512 * 1024 * 1024)
-    max_file_bytes = int(os.environ.get("AIDER_FSM_HF_MAX_FILE_BYTES") or 256 * 1024 * 1024)
+    max_total_bytes = int(os.environ.get("OPENCODE_FSM_HF_MAX_TOTAL_BYTES") or 512 * 1024 * 1024)
+    max_file_bytes = int(os.environ.get("OPENCODE_FSM_HF_MAX_FILE_BYTES") or 256 * 1024 * 1024)
     total_bytes = 0
     downloaded: list[dict[str, object]] = []
     errors: list[str] = []
@@ -180,7 +180,7 @@ def _download_hf_dataset_snapshot(
         "total_bytes": total_bytes,
         "errors": errors,
     }
-    (dest / ".aider_fsm").mkdir(exist_ok=True)
+    (dest / ".opencode_fsm").mkdir(exist_ok=True)
     (dest / "data").mkdir(exist_ok=True)
     (dest / "data" / "hf_manifest.json").write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
@@ -359,7 +359,7 @@ def prepare_repo(repo_arg: str, *, clones_dir: Path | None = None) -> PreparedRe
     if base is None:
         candidates = [
             _PREFERRED_CLONES_BASE,
-            Path(tempfile.gettempdir()) / "aider_fsm_targets",
+            Path(tempfile.gettempdir()) / "opencode_fsm_targets",
         ]
         base2 = None
         for raw_base in candidates:
@@ -368,7 +368,7 @@ def prepare_repo(repo_arg: str, *, clones_dir: Path | None = None) -> PreparedRe
                 b.mkdir(parents=True, exist_ok=True)
             except Exception:
                 continue
-            probe = b / ".aider_fsm_write_probe"
+            probe = b / ".opencode_fsm_write_probe"
             try:
                 probe.write_text("ok\n", encoding="utf-8")
                 probe.unlink()
@@ -377,7 +377,7 @@ def prepare_repo(repo_arg: str, *, clones_dir: Path | None = None) -> PreparedRe
             except Exception:
                 continue
         if base2 is None:
-            base2 = (Path(tempfile.gettempdir()) / "aider_fsm_targets").expanduser().resolve()
+            base2 = (Path(tempfile.gettempdir()) / "opencode_fsm_targets").expanduser().resolve()
         base = base2
     base = base.expanduser().resolve()
     base.mkdir(parents=True, exist_ok=True)
@@ -425,7 +425,7 @@ def prepare_repo(repo_arg: str, *, clones_dir: Path | None = None) -> PreparedRe
     # Depth=1 keeps it fast; users can re-run with a local clone if needed.
     cmd = ["git", "clone", "--depth", "1", url, str(dest)]
     try:
-        clone_timeout = float(os.environ.get("AIDER_FSM_GIT_CLONE_TIMEOUT_SECONDS") or 90)
+        clone_timeout = float(os.environ.get("OPENCODE_FSM_GIT_CLONE_TIMEOUT_SECONDS") or 90)
     except Exception:
         clone_timeout = 90.0
     try:

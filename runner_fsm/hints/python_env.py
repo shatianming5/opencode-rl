@@ -162,11 +162,11 @@ def _infer_uv_python_candidates(repo: Path, *, env: dict[str, str]) -> list[str]
     env2 = dict(env or {})
     out: list[str] = []
 
-    raw_candidates = _parse_json_str_list(env2.get("AIDER_FSM_HINT_UV_PYTHON_CANDIDATES_JSON"))
+    raw_candidates = _parse_json_str_list(env2.get("OPENCODE_FSM_HINT_UV_PYTHON_CANDIDATES_JSON"))
     if raw_candidates:
         out.extend([c.strip() for c in raw_candidates if isinstance(c, str) and c.strip()])
     else:
-        single = str(env2.get("AIDER_FSM_HINT_UV_PYTHON") or env2.get("UV_PYTHON") or "").strip()
+        single = str(env2.get("OPENCODE_FSM_HINT_UV_PYTHON") or env2.get("UV_PYTHON") or "").strip()
         if single:
             out.append(single)
 
@@ -236,7 +236,7 @@ def _try_uv_venv_retry(
     if not uv_py_candidates:
         return None
 
-    raw_venv_dir = str(env2.get("AIDER_FSM_HINT_UV_VENV_DIR") or "").strip()
+    raw_venv_dir = str(env2.get("OPENCODE_FSM_HINT_UV_VENV_DIR") or "").strip()
     uv_try = [uv_py_candidates[0]] if raw_venv_dir else list(uv_py_candidates)
     last_err = ""
     for py_req in uv_try:
@@ -251,7 +251,7 @@ def _try_uv_venv_retry(
             if not venv_dir.is_absolute():
                 venv_dir = (repo / venv_dir).resolve()
         else:
-            venv_dir = (repo / ".aider_fsm" / f"venv_hints_{tag}").resolve()
+            venv_dir = (repo / ".opencode_fsm" / f"venv_hints_{tag}").resolve()
         py_bin = (venv_dir / "bin" / "python").absolute()
         try:
             venv_dir.parent.mkdir(parents=True, exist_ok=True)
@@ -275,7 +275,7 @@ def _try_uv_venv_retry(
         old_path = str(envx.get("PATH") or "")
         envx["PATH"] = str((venv_dir / "bin").absolute()) + (os.pathsep + old_path if old_path else "")
         envx["VIRTUAL_ENV"] = str(venv_dir.absolute())
-        envx["AIDER_FSM_PYTHON"] = str(py_bin)
+        envx["OPENCODE_FSM_PYTHON"] = str(py_bin)
         envx["PYTHON"] = str(py_bin)
         envx.setdefault("UV_PYTHON", str(py_req).strip())
 

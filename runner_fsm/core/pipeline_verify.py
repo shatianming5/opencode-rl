@@ -102,9 +102,9 @@ def _run_stage(
 ) -> StageResult:
     stage = stage.strip() or "stage"
     env2 = dict(env)
-    env2["AIDER_FSM_STAGE"] = stage
-    env2["AIDER_FSM_ARTIFACTS_DIR"] = str(artifacts_dir.resolve())
-    env2["AIDER_FSM_REPO_ROOT"] = str(repo.resolve())
+    env2["OPENCODE_FSM_STAGE"] = stage
+    env2["OPENCODE_FSM_ARTIFACTS_DIR"] = str(artifacts_dir.resolve())
+    env2["OPENCODE_FSM_REPO_ROOT"] = str(repo.resolve())
     results: list[CmdResult] = []
     started = time.monotonic()
 
@@ -298,8 +298,8 @@ def run_pipeline_verification(
 
     env_base = dict(os.environ)
     runner_root = Path(__file__).resolve().parents[1]
-    env_base.setdefault("AIDER_FSM_RUNNER_ROOT", str(runner_root))
-    env_base.setdefault("AIDER_FSM_PYTHON", sys.executable)
+    env_base.setdefault("OPENCODE_FSM_RUNNER_ROOT", str(runner_root))
+    env_base.setdefault("OPENCODE_FSM_PYTHON", sys.executable)
     existing_pp = str(env_base.get("PYTHONPATH") or "")
     parts = [p for p in existing_pp.split(os.pathsep) if p]
     root_s = str(runner_root)
@@ -308,7 +308,7 @@ def run_pipeline_verification(
 
     if pipeline is not None:
         max_cmd = None
-        raw = env_base.get("AIDER_FSM_MAX_CMD_SECONDS")
+        raw = env_base.get("OPENCODE_FSM_MAX_CMD_SECONDS")
         if isinstance(raw, str) and raw.strip():
             raw = raw.strip()
         else:
@@ -317,7 +317,7 @@ def run_pipeline_verification(
                 pipeline.auth_env, pipeline.tests_env, pipeline.deploy_env,
                 pipeline.rollout_env, pipeline.evaluation_env, pipeline.benchmark_env,
             ):
-                vv = m.get("AIDER_FSM_MAX_CMD_SECONDS") if isinstance(m, dict) else None
+                vv = m.get("OPENCODE_FSM_MAX_CMD_SECONDS") if isinstance(m, dict) else None
                 if isinstance(vv, str) and vv.strip():
                     raw = vv.strip()
                     break
@@ -329,7 +329,7 @@ def run_pipeline_verification(
             max_cmd = n if isinstance(n, int) and n > 0 else None
 
         max_total = None
-        raw = env_base.get("AIDER_FSM_MAX_TOTAL_SECONDS")
+        raw = env_base.get("OPENCODE_FSM_MAX_TOTAL_SECONDS")
         if isinstance(raw, str) and raw.strip():
             raw = raw.strip()
         else:
@@ -338,7 +338,7 @@ def run_pipeline_verification(
                 pipeline.auth_env, pipeline.tests_env, pipeline.deploy_env,
                 pipeline.rollout_env, pipeline.evaluation_env, pipeline.benchmark_env,
             ):
-                vv = m.get("AIDER_FSM_MAX_TOTAL_SECONDS") if isinstance(m, dict) else None
+                vv = m.get("OPENCODE_FSM_MAX_TOTAL_SECONDS") if isinstance(m, dict) else None
                 if isinstance(vv, str) and vv.strip():
                     raw = vv.strip()
                     break
@@ -408,7 +408,7 @@ def run_pipeline_verification(
 
             # Hints validation
             eval_env = safe_env(env_base, pipeline.evaluation_env, unattended=unattended)
-            if _is_truthy(eval_env.get("AIDER_FSM_REQUIRE_HINTS")):
+            if _is_truthy(eval_env.get("OPENCODE_FSM_REQUIRE_HINTS")):
                 hints_err = _validate_hints(repo, eval_env, artifacts_dir, metrics_errors)
                 if hints_err:
                     return _build_result(ok=False, failed_stage="evaluation",
@@ -520,11 +520,11 @@ def _validate_hints(
     metrics_errors: list[str],
 ) -> bool:
     """Validate hints_used.json and hints_run.json. Returns True if validation failed."""
-    expected = _parse_json_str_list(eval_env.get("AIDER_FSM_HINT_ANCHORS_JSON"))
+    expected = _parse_json_str_list(eval_env.get("OPENCODE_FSM_HINT_ANCHORS_JSON"))
     repo2 = Path(repo).resolve()
 
     # Check hints_used.json
-    path = (repo2 / ".aider_fsm" / "hints_used.json").resolve()
+    path = (repo2 / ".opencode_fsm" / "hints_used.json").resolve()
     if not path.exists():
         ok_hints, hint_reason = False, f"missing_hints_used_json: {path}"
     else:
@@ -565,7 +565,7 @@ def _validate_hints(
         return True
 
     # Check hints_run.json
-    path = (repo2 / ".aider_fsm" / "hints_run.json").resolve()
+    path = (repo2 / ".opencode_fsm" / "hints_run.json").resolve()
     if not path.exists():
         ok_run, run_reason = False, f"missing_hints_run_json: {path}"
     else:

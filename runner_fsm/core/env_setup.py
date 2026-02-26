@@ -57,7 +57,7 @@ class DeployCallResult:
 
 def _default_artifacts_dir(repo: Path, *, prefix: str) -> Path:
     run_id = time.strftime("%Y%m%d_%H%M%S", time.localtime())
-    return (repo / ".aider_fsm" / "artifacts" / run_id / prefix).resolve()
+    return (repo / ".opencode_fsm" / "artifacts" / run_id / prefix).resolve()
 
 
 def _resolve_model(raw_model: str) -> str:
@@ -174,7 +174,7 @@ def open_env(
             contract_before = snapshot_contract_files(repo_root)
             runner_written_paths: set[str] = set()
             try:
-                max_scaffold_attempts = int(os.environ.get("AIDER_OPENCODE_SCAFFOLD_ATTEMPTS") or 5)
+                max_scaffold_attempts = int(os.environ.get("OPENCODE_SCAFFOLD_ATTEMPTS") or 5)
             except Exception:
                 max_scaffold_attempts = 5
             max_scaffold_attempts = max(1, min(10, int(max_scaffold_attempts)))

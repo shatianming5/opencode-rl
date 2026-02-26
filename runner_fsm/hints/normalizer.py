@@ -129,7 +129,7 @@ def normalize_hint_command(cmd: str, *, env: dict[str, str]) -> tuple[str, str |
         s2,
     )
 
-    model = (env.get("AIDER_LLM_MODEL") or env.get("OPENAI_MODEL") or "").strip()
+    model = (env.get("OPENCODE_LLM_MODEL") or env.get("OPENAI_MODEL") or "").strip()
     base_url = (env.get("OPENAI_API_BASE") or env.get("OPENAI_BASE_URL") or "").strip()
     if model:
         s2 = _replace_flag_value(s2, flag="--model", new_value=model)
@@ -148,8 +148,8 @@ def normalize_hint_command(cmd: str, *, env: dict[str, str]) -> tuple[str, str |
     if not s2:
         return "", "empty_after_sanitize"
 
-    py = (env.get("AIDER_FSM_PYTHON") or env.get("PYTHON") or "python3").strip() or "python3"
-    repo_root = str(env.get("AIDER_FSM_REPO_ROOT") or "").strip()
+    py = (env.get("OPENCODE_FSM_PYTHON") or env.get("PYTHON") or "python3").strip() or "python3"
+    repo_root = str(env.get("OPENCODE_FSM_REPO_ROOT") or "").strip()
     if repo_root and ("/" in py or py.startswith((".", "~"))):
         try:
             p = Path(py).expanduser()
@@ -285,7 +285,7 @@ def normalize_hint_command(cmd: str, *, env: dict[str, str]) -> tuple[str, str |
         bounded.append(line)
     s2 = "\n".join(bounded)
 
-    strip_pytest_n = _is_truthy(env.get("AIDER_FSM_HINT_STRIP_PYTEST_N", "1"))
+    strip_pytest_n = _is_truthy(env.get("OPENCODE_FSM_HINT_STRIP_PYTEST_N", "1"))
     if strip_pytest_n:
         stripped: list[str] = []
         for line in s2.splitlines():
