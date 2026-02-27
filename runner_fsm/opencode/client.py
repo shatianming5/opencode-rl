@@ -47,6 +47,10 @@ class OpenCodeRequestError(RuntimeError):
         self.status = status
         self.detail = detail
 
+class StaleThinkingTimeout(RuntimeError):
+    """Raised when the LLM has been thinking without progress for too long."""
+    pass
+
 class OpenCodeClient(AgentClient):
 
     def __init__(
@@ -72,6 +76,7 @@ class OpenCodeClient(AgentClient):
         username: str | None = None,
         password: str | None = None,
         session_title: str | None = None,
+        stale_timeout: float = 180.0,
     ) -> None:
         self._repo = repo
         self._plan_rel = str(plan_rel or "PLAN.md").strip() or "PLAN.md"
@@ -133,6 +138,8 @@ class OpenCodeClient(AgentClient):
             provider_id, model_id = "openai", model_str
         self._model_obj: dict[str, str] = {"providerID": provider_id, "modelID": model_id}
         self._model_str: str = f"{provider_id}/{model_id}"
+
+        self._stale_timeout = max(0.0, float(stale_timeout or 180.0))
 
         self._proc: subprocess.Popen[str] | None = None
         self._proxy_proc: subprocess.Popen[str] | None = None
@@ -289,11 +296,20 @@ class OpenCodeClient(AgentClient):
             | <<< stream end 523 tokens 4.2s
         """
 
-        def __init__(self, token_log: Path | None, turn: int, heartbeat_interval: float = 5.0):
+        _DEFAULT_STALE_TIMEOUT = 180.0
+
+        def __init__(self, token_log: Path | None, turn: int,
+                     heartbeat_interval: float = 5.0,
+                     stale_timeout: float = 180.0,
+                     server_proc=None):
             self._token_log = token_log
             self._turn = turn
             self._interval = heartbeat_interval
+            self._stale_timeout = stale_timeout
+            self._server_proc = server_proc  # 超时时杀进程触发重试
+            self._client_ref = None  # set externally to flag stale timeout on client
             self._stop = threading.Event()
+            self._timed_out = threading.Event()
             self._thread: threading.Thread | None = None
             self._start = 0.0
             self._log_offset = 0
@@ -306,7 +322,11 @@ class OpenCodeClient(AgentClient):
                     self._log_offset = self._token_log.stat().st_size
                 except Exception:
                     self._log_offset = 0
-                print(f"    ... waiting for LLM response (turn {self._turn})", flush=True)
+                try:
+                    from pipeline.ui import console as _rc
+                    _rc.print(f"    [dim italic]... waiting for LLM response (turn {self._turn})[/]")
+                except Exception:
+                    print(f"    ... waiting for LLM response (turn {self._turn})", flush=True)
             self._thread = threading.Thread(target=self._run, daemon=True)
             self._thread.start()
 
@@ -319,19 +339,107 @@ class OpenCodeClient(AgentClient):
                 text = self._line_buf.strip()
                 if len(text) > 200:
                     text = text[:197] + "..."
-                print(f"    | {text}", flush=True)
+                self._print_token_line(text)
                 self._line_buf = ""
+
+        @staticmethod
+        def _try_rich():
+            """Get rich console if available."""
+            try:
+                from pipeline.ui import console as _rc
+                return _rc
+            except Exception:
+                return None
+
+        def _print_thinking(self, elapsed: float):
+            rc = self._try_rich()
+            if rc:
+                rc.print(f"    [dim italic]... LLM thinking ({elapsed:.0f}s)[/]")
+            else:
+                print(f"    ... LLM thinking ({elapsed:.0f}s)", flush=True)
+
+        def _print_tool_call(self, tool_name: str, elapsed: float):
+            rc = self._try_rich()
+            if rc:
+                rc.print(f"    [bold cyan]... agent calling: {tool_name}[/] [dim]({elapsed:.0f}s)[/]")
+            else:
+                print(f"    ... agent calling: {tool_name} ({elapsed:.0f}s)", flush=True)
+
+        def _print_tool_detail(self, detail: str):
+            if len(detail) > 200:
+                detail = detail[:197] + "..."
+            rc = self._try_rich()
+            if rc:
+                rc.print(f"    [cyan]    {detail}[/]")
+            else:
+                print(f"        {detail}", flush=True)
+
+        def _print_tool_content(self, text: str):
+            """Print tool content preview line (file content, diff, etc.)."""
+            if len(text) > 150:
+                text = text[:147] + "..."
+            rc = self._try_rich()
+            if rc:
+                # diff 着色
+                if text.startswith("+") and not text.startswith("+++"):
+                    rc.print(f"    [green]      {text}[/]")
+                elif text.startswith("-") and not text.startswith("---"):
+                    rc.print(f"    [red]      {text}[/]")
+                elif text.startswith("@@") or text.startswith("---") or text.startswith("+++"):
+                    rc.print(f"    [cyan]      {text}[/]")
+                elif text.startswith("*** "):
+                    rc.print(f"    [bold cyan]      {text}[/]")
+                else:
+                    rc.print(f"    [dim]      {text}[/]")
+            else:
+                print(f"          {text}", flush=True)
+
+        def _print_token_line(self, text: str):
+            if len(text) > 200:
+                text = text[:197] + "..."
+            rc = self._try_rich()
+            if rc:
+                rc.print(f"    [dim]| {text}[/]")
+            else:
+                print(f"    | {text}", flush=True)
+
+        def is_timed_out(self) -> bool:
+            """Whether the monitor triggered a stale-thinking timeout."""
+            return self._timed_out.is_set()
 
         def _run(self):
             last_activity = time.time()
+            last_real_activity = time.time()  # 只在有真实内容时更新
             while not self._stop.wait(0.3):
                 printed = self._tail_token_log()
                 now = time.time()
                 if printed:
                     last_activity = now
+                    last_real_activity = now
                 elif (now - last_activity) >= self._interval:
                     elapsed = now - self._start
-                    print(f"    ... LLM thinking ({elapsed:.0f}s)", flush=True)
+                    stale = now - last_real_activity
+                    # 检测 LLM 长时间无进展
+                    if self._stale_timeout and stale > self._stale_timeout:
+                        rc = self._try_rich()
+                        msg = (f"    LLM stale for {stale:.0f}s "
+                               f"(>{self._stale_timeout:.0f}s), aborting to retry...")
+                        if rc:
+                            rc.print(f"    [bold yellow]{msg}[/]")
+                        else:
+                            print(f"    {msg}", flush=True)
+                        self._timed_out.set()
+                        # Signal client to NOT recover — propagate the error
+                        if self._client_ref is not None:
+                            self._client_ref._stale_timeout_flag = True
+                        # 杀掉 server 进程以中断阻塞的 HTTP 请求
+                        if self._server_proc:
+                            try:
+                                self._server_proc.kill()
+                            except Exception:
+                                pass
+                        break
+                    self._print_thinking(elapsed)
                     last_activity = now
 
         def _tail_token_log(self) -> bool:
@@ -354,22 +462,52 @@ class OpenCodeClient(AgentClient):
             for ch in new:
                 if ch == "\n":
                     line = self._line_buf.strip()
-                    if line:
-                        # Metadata lines (>>> / <<<) print as-is; token lines truncate
-                        if len(line) > 200:
-                            line = line[:197] + "..."
-                        print(f"    | {line}", flush=True)
-                        printed = True
                     self._line_buf = ""
+                    if not line:
+                        continue
+                    # 过滤噪音
+                    if ("[DBG" in line
+                            or ">>> stream" in line
+                            or "<<< stream" in line
+                            or '"encrypted_content"' in line
+                            or ('"type":"response.' in line and len(line) > 150)):
+                        continue
+                    # [TOOL_CONTENT] → 工具内容预览行（缩进显示）
+                    if line.startswith("[TOOL_CONTENT] "):
+                        content = line[15:]
+                        self._print_tool_content(content)
+                        printed = True
+                        continue
+                    # [TOOL_DETAIL] → 详细信息（缩进显示在 [TOOL] 下方）
+                    if line.startswith("[TOOL_DETAIL] "):
+                        detail = line[14:].strip()
+                        self._print_tool_detail(detail)
+                        printed = True
+                        continue
+                    # [TOOL] → agent 正在调用工具
+                    if line.startswith("[TOOL] "):
+                        tool_name = line[7:].strip()
+                        elapsed = time.time() - self._start
+                        self._print_tool_call(tool_name, elapsed)
+                        printed = True
+                        continue
+                    self._print_token_line(line)
+                    printed = True
                 else:
                     self._line_buf += ch
                     # Flush partial tokens every 80 chars (show streaming progress)
-                    if len(self._line_buf) >= 80 and "\n" not in self._line_buf:
+                    # BUT: [TOOL lines must be processed as complete lines — don't split them
+                    buf_len = len(self._line_buf)
+                    if buf_len >= 80 and "\n" not in self._line_buf:
                         text = self._line_buf.strip()
-                        if text:
-                            print(f"    | {text}", flush=True)
-                            printed = True
-                        self._line_buf = ""
+                        # Keep accumulating [TOOL lines until newline (up to 500 char safety limit)
+                        if text.startswith("[TOOL") and buf_len < 500:
+                            pass  # keep accumulating
+                        else:
+                            if text and "[DBG" not in text and ">>> stream" not in text and "<<< stream" not in text:
+                                self._print_token_line(text)
+                                printed = True
+                            self._line_buf = ""
             return printed
 
     def run(self, text: str, *, fsm_state: str, iter_idx: int, purpose: str, on_turn=None) -> AgentResult:
@@ -388,8 +526,16 @@ class OpenCodeClient(AgentClient):
 
         prompt = text
         trace: list[dict[str, Any]] = []
+        self._stale_timeout_flag = False  # reset per run
         for turn_idx in range(self._max_turns):
-            monitor = self._LLMWaitMonitor(self._token_log_path, turn_idx + 1) if on_turn else None
+            monitor = None
+            if on_turn:
+                monitor = self._LLMWaitMonitor(
+                    self._token_log_path, turn_idx + 1,
+                    stale_timeout=self._stale_timeout,
+                    server_proc=self._proc if hasattr(self, '_proc') else None,
+                )
+                monitor._client_ref = self  # allow monitor to signal stale timeout
             try:
                 if monitor:
                     monitor.start()
@@ -401,6 +547,8 @@ class OpenCodeClient(AgentClient):
                         msg = self._post_message_with_retry(model=self._model_str, text=prompt)
                     else:
                         raise
+            except StaleThinkingTimeout:
+                raise  # propagate stale timeout without recovery
             finally:
                 if monitor:
                     monitor.stop()
@@ -451,9 +599,12 @@ class OpenCodeClient(AgentClient):
                     on_turn(TurnEvent(turn=turn_idx + 1, assistant_text=assistant_text, finished=True))
                 return AgentResult(assistant_text=assistant_text, raw=msg, tool_trace=trace)
 
+            # 逐个执行工具调用，每完成一个就回调 on_turn，实时显示进展
             results = execute_tool_calls(calls, repo=self._repo, policy=policy)
             compact_results: list[dict[str, Any]] = []
-            for r in results:
+            calls_list = list(calls)
+            results_list = list(results)
+            for call_idx, r in enumerate(results_list):
                 detail = dict(r.detail or {})
                 if isinstance(detail.get("content"), str):
                     detail["content"] = tail(detail["content"], 4000)
@@ -462,6 +613,16 @@ class OpenCodeClient(AgentClient):
                 if isinstance(detail.get("stderr"), str):
                     detail["stderr"] = tail(detail["stderr"], 4000)
                 compact_results.append(detail | {"tool": r.kind, "ok": bool(r.ok)})
+
+                # 实时回调：每完成一个工具调用就通知，让 stream printer 显示进展
+                if on_turn and call_idx < len(calls_list):
+                    on_turn(TurnEvent(
+                        turn=turn_idx + 1,
+                        assistant_text=assistant_text if call_idx == 0 else "",
+                        calls=[calls_list[call_idx]],
+                        results=[results_list[call_idx]],
+                    ))
+
             trace.append(
                 {
                     "turn": int(turn_idx + 1),
@@ -471,19 +632,11 @@ class OpenCodeClient(AgentClient):
                             "kind": str(c.kind),
                             "payload": c.payload if isinstance(c.payload, (dict, list, str, int, float, bool)) else str(c.payload),
                         }
-                        for c in calls
+                        for c in calls_list
                     ],
                     "results": compact_results,
                 }
             )
-
-            if on_turn:
-                on_turn(TurnEvent(
-                    turn=turn_idx + 1,
-                    assistant_text=assistant_text,
-                    calls=list(calls),
-                    results=list(results),
-                ))
 
             # For scaffold runs, we don't need the agent to "finish talking" if the contract
             # is already valid. Some models keep emitting extra tool calls indefinitely.
@@ -631,7 +784,6 @@ class OpenCodeClient(AgentClient):
                 "--port", str(proxy_port),
                 "--upstream", upstream_url,
                 "--log", str(self._token_log_path),
-                "--debug",
             ],
             stdin=subprocess.DEVNULL,
             stdout=self._proxy_log_file,
@@ -702,6 +854,12 @@ class OpenCodeClient(AgentClient):
                             "timeout",
                         )
                         transport_unavailable = any(n in d for n in needles)
+
+                # If stale timeout killed the server, don't recover — let it propagate
+                if getattr(self, '_stale_timeout_flag', False):
+                    raise StaleThinkingTimeout(
+                        f"LLM stale thinking timeout — server killed by monitor"
+                    ) from e
 
                 if transport_unavailable and recover_tries < recover_budget:
                     recover_tries += 1
@@ -838,11 +996,15 @@ class OpenCodeClient(AgentClient):
         if include_context and self._context_length is not None:
             # Best-effort: different OpenCode versions may ignore this field.
             body["contextLength"] = int(self._context_length)
+        # HTTP 超时自动跟随 stale_timeout：让 stale monitor 做真正的超时控制，
+        # HTTP 层只是兜底安全网，永远不应先于 stale monitor 触发。
+        msg_timeout = max(self._timeout_seconds, self._stale_timeout + 120)
         data = self._request_json(
             "POST",
             f"/session/{self._session_id}/message",
             body=body,
             require_auth=bool(self._server.password),
+            timeout_seconds=msg_timeout,
         )
         # Some OpenCode builds/transports may respond with 200 + empty body; treat it as a transient transport failure
         # so the caller can retry or recover the local session instead of silently returning "None".
@@ -867,22 +1029,83 @@ class OpenCodeClient(AgentClient):
 
         req = Request(url, method=method, data=data, headers=headers)
         timeout = self._timeout_seconds if timeout_seconds is None else float(timeout_seconds)
-        try:
-            with urlopen(req, timeout=timeout) as resp:
-                raw = resp.read()
-                if not raw:
-                    return None
-                return json.loads(raw.decode("utf-8", errors="replace"))
-        except HTTPError as e:
-            detail = ""
+
+        # Use a background thread for the HTTP request so we can check
+        # the stale timeout flag and abort early instead of blocking for
+        # the full HTTP timeout (300s).
+        result_container: list = []  # [value] or []
+        error_container: list = []   # [exception] or []
+        resp_ref: list = []          # [response] — 用于外部强制关闭
+
+        def _do_request():
             try:
-                detail = e.read().decode("utf-8", errors="replace")
-            except Exception:
-                detail = str(e)
-            raise OpenCodeRequestError(method=method, url=url, status=int(getattr(e, "code", 0) or 0), detail=tail(detail, 2000))
-        except URLError as e:
-            raise OpenCodeRequestError(method=method, url=url, status=None, detail=str(e))
-        except (TimeoutError, socket.timeout) as e:
-            raise OpenCodeRequestError(method=method, url=url, status=None, detail=f"timeout: {e}")
-        except OSError as e:
-            raise OpenCodeRequestError(method=method, url=url, status=None, detail=f"os_error: {e}")
+                resp = urlopen(req, timeout=timeout)
+                resp_ref.append(resp)
+                try:
+                    raw = resp.read()
+                    if not raw:
+                        result_container.append(None)
+                    else:
+                        result_container.append(json.loads(raw.decode("utf-8", errors="replace")))
+                finally:
+                    try:
+                        resp.close()
+                    except Exception:
+                        pass
+            except Exception as exc:
+                error_container.append(exc)
+
+        req_thread = threading.Thread(target=_do_request, daemon=True)
+        req_thread.start()
+
+        # Poll every 2s, checking for stale timeout flag
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            req_thread.join(timeout=2.0)
+            if not req_thread.is_alive():
+                break
+            # Check if stale timeout was triggered — abort immediately
+            if getattr(self, '_stale_timeout_flag', False):
+                # 强制关闭底层连接，让后台线程的 read() 立即失败退出
+                for r in resp_ref:
+                    try:
+                        r.close()
+                    except Exception:
+                        pass
+                # 等线程退出（server 已被 kill，socket 应该很快 RST）
+                req_thread.join(timeout=5.0)
+                raise StaleThinkingTimeout(
+                    "LLM stale thinking timeout — aborting HTTP request"
+                )
+
+        if req_thread.is_alive():
+            # Thread still running after deadline — force close and treat as timeout
+            for r in resp_ref:
+                try:
+                    r.close()
+                except Exception:
+                    pass
+            raise OpenCodeRequestError(
+                method=method, url=url, status=None,
+                detail=f"timeout: request exceeded {timeout}s",
+            )
+
+        if error_container:
+            e = error_container[0]
+            if isinstance(e, HTTPError):
+                detail = ""
+                try:
+                    detail = e.read().decode("utf-8", errors="replace")
+                except Exception:
+                    detail = str(e)
+                raise OpenCodeRequestError(method=method, url=url, status=int(getattr(e, "code", 0) or 0), detail=tail(detail, 2000))
+            elif isinstance(e, URLError):
+                raise OpenCodeRequestError(method=method, url=url, status=None, detail=str(e))
+            elif isinstance(e, (TimeoutError, socket.timeout)):
+                raise OpenCodeRequestError(method=method, url=url, status=None, detail=f"timeout: {e}")
+            elif isinstance(e, OSError):
+                raise OpenCodeRequestError(method=method, url=url, status=None, detail=f"os_error: {e}")
+            else:
+                raise OpenCodeRequestError(method=method, url=url, status=None, detail=f"error: {e}")
+
+        return result_container[0] if result_container else None

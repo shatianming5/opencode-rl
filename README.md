@@ -1,13 +1,12 @@
 # OpenCode RL
 
-使用 OpenCode 进行 RL 后训练的自动化 Pipeline，集成 FSM-Runner 合同驱动执行框架实现模型部署、Rollout 采样和评测的全流程自动化。
+使用 OpenCode 进行 RL 后训练的自动化 Pipeline，通过 `train.py --eval-only` 复用训练 reward 函数进行评测。
 
 ## 功能
 
-- 固定阶段式 Pipeline：代码生成 → 训练执行 → 模型部署 → Rollout 采样 → 评测
+- 固定阶段式 Pipeline：代码生成 → 训练执行 → 评测（train.py --eval-only） → 迭代改进
 - 支持 GRPO/DPO/PPO 训练（基于 trl）
-- FSM-Runner 合同驱动：通过 `pipeline.yml` 定义 deploy/rollout/evaluation 各阶段
-- 阶段缓存：部署成功后自动缓存，下次跳过重复部署（SHA256 校验 + TTL + Health Check）
+- 训练和评测共用同一套 reward 函数，避免两套实现不一致
 - Benchmark 注册表：自动发现 `benchmarks/` 下的所有 benchmark，新增只需一个 `config.yaml`
 - 运行隔离：每次运行产物存放在 `runs/{benchmark}_{timestamp}/`
 - 结果导出：支持导入到 RD-Agent UI 进行可视化查看
@@ -38,15 +37,7 @@ export OPENCODE_MODEL="gpt-5.1-codex"
 python main.py --benchmark mbpp --base-model Qwen/Qwen2.5-0.5B-Instruct
 ```
 
-FSM Deploy + Rollout + Evaluate 始终启用，可通过参数调整引擎和模式：
-
-```bash
-python main.py \
-    --benchmark mbpp \
-    --base-model Qwen/Qwen2.5-0.5B-Instruct \
-    --fsm-deploy-engine local \
-    --fsm-mode smoke
-```
+评测阶段通过 `train.py --eval-only` 自动完成，复用训练时的 reward 函数。
 
 ### 运行脚本（推荐）
 
@@ -135,21 +126,6 @@ python3 export_to_ui.py --run-dir runs/mbpp_20260226_153910
 | `OPENCODE_URL` | OpenCode server 地址（可选，留空自动启动本地 server） |
 | `XDG_CONFIG_HOME` | 项目专属 OpenCode 配置目录（运行脚本自动设置） |
 | `CUDA_VISIBLE_DEVICES` | GPU 选择 |
-| `FSM_DEPLOY_ENGINE` | 部署引擎（`vllm`/`tgi`/`local`，默认 `vllm`） |
-| `FSM_MODE` | 执行模式（`smoke`/`full`，默认 `smoke`） |
-
-### FSM 高级配置
-
-| 变量 | 用途 | 默认值 |
-|------|------|--------|
-| `OPENCODE_FSM_CACHE_TTL` | 缓存 TTL 秒数 | 3600 |
-| `OPENCODE_FSM_CACHE_ENABLED` | 启用阶段缓存 | 1 |
-| `OPENCODE_EVAL_MODE` | 评测模式 (`smoke`/`full`) | smoke |
-| `OPENCODE_EVAL_LIMIT` | 评测样本上限 | 200 |
-| `OPENCODE_FSM_REQUIRE_HINTS` | 要求执行 hints | 0 |
-| `OPENCODE_LLM_MODEL` | LLM 模型名（FSM 内部） | - |
-| `OPENCODE_LLM_KIND` | 推理类型 (`local_hf`/`remote`) | - |
-| `OPENCODE_FSM_PYTHON` | Python 解释器路径 | python3 |
 
 ## 项目结构
 
@@ -246,25 +222,23 @@ flowchart TD
         direction TB
 
         A["Phase 1 — 代码生成<br/>OpenCode LLM 生成 train.py"]
-        A --> B["Phase 2 — 训练执行<br/>python train.py"]
+        A --> B["Phase 2 — 训练执行<br/>accelerate launch train.py"]
         B --> C{训练成功?}
         C -- "失败 → 修复重试<br/>(OpenCode LLM, 最多 20 次)" --> B
-        C -- 成功 --> D["Phase 3 — 部署模型<br/>vLLM / TGI / Local + 健康检查"]
-        D --> E["Phase 4 — Rollout<br/>用部署模型生成 samples.jsonl"]
-        E --> F{通过率 > 0?}
-        F -- "全零 → 自动修复重试<br/>(OpenCode LLM, 最多 3 次)" --> E
-        F -- 是 --> G["Phase 5 — 评测打分<br/>计算 pass@1 准确率"]
-        G --> H["Phase 6 — 迭代分析<br/>OpenCode LLM 总结并规划下轮改进"]
+        C -- 成功 --> D["Phase 3 — 评测<br/>python train.py --eval-only<br/>复用训练 reward 函数"]
+        D --> E{通过率 > 0?}
+        E -- "全零 → 自动修复重试<br/>(OpenCode LLM, 最多 2 次)" --> D
+        E -- 是 --> F["Phase 4 — 评测打分<br/>从 samples.jsonl 计算 pass@1"]
+        F --> G["Phase 5 — 迭代分析<br/>OpenCode LLM 总结并规划下轮改进"]
     end
 
-    H --> More{还有迭代?}
+    G --> More{还有迭代?}
     More -- 是 --> A
     More -- 否 --> End(["输出 pipeline_results.json"])
 
     style Iter fill:#f8f9fa,stroke:#dee2e6,stroke-width:2px
     style D fill:#e3f2fd,stroke:#1976d2
-    style E fill:#e3f2fd,stroke:#1976d2
-    style G fill:#e3f2fd,stroke:#1976d2
+    style F fill:#e3f2fd,stroke:#1976d2
 ```
 
 ## 新增 Benchmark
@@ -287,9 +261,8 @@ python main.py \
     --base-model {model}            # 基础模型（HF 或本地路径）
     --max-iterations {n}            # 最大迭代次数（默认 5）
     --max-fix-retries {n}           # 训练失败最大修复次数（默认 20）
+    --max-eval-repair-retries {n}   # 评测零分最大修复次数（默认 2）
     --training-timeout {seconds}    # 训练超时秒数（默认 3600）
-    --fsm-deploy-engine {engine}    # 部署引擎：vllm/tgi/local（默认 vllm）
-    --fsm-mode {mode}               # 执行模式：smoke/full（默认 smoke）
     --run-dir {path}                # 自定义输出目录
     --list-benchmarks               # 列出可用 benchmark
 ```

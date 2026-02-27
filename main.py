@@ -2,7 +2,7 @@
 """
 OpenCode RL Post-training Pipeline (Fixed-Stage)
 
-每轮迭代：代码生成 → 训练执行 → FSM 部署/rollout → 评测提交 → 反馈注入。
+每轮迭代：代码生成 → 训练执行 → --eval-only 评测 → 反馈注入。
 """
 
 import argparse
@@ -17,32 +17,6 @@ from pipeline.runner import run_pipeline
 from pipeline.utils import resolve_model_path
 
 
-def _init_fsm_workspace(project_root: Path, target: Path) -> None:
-    """将项目根目录的 .opencode_fsm 模板复制到运行目录，实现每次运行隔离。"""
-    src_fsm = project_root / ".opencode_fsm"
-    dst_fsm = target / ".opencode_fsm"
-
-    if not src_fsm.exists():
-        return
-
-    dst_fsm.mkdir(parents=True, exist_ok=True)
-
-    src_stages = src_fsm / "stages"
-    dst_stages = dst_fsm / "stages"
-    if src_stages.is_dir() and not dst_stages.exists():
-        shutil.copytree(src_stages, dst_stages)
-
-    src_pipeline = project_root / "pipeline.yml"
-    dst_pipeline = target / "pipeline.yml"
-    if src_pipeline.exists() and not dst_pipeline.exists():
-        shutil.copy2(src_pipeline, dst_pipeline)
-
-    dst_runner = dst_fsm / "runner"
-    src_runner_fsm = project_root / "runner_fsm"
-    if src_runner_fsm.is_dir() and not dst_runner.exists():
-        dst_runner.symlink_to(src_runner_fsm.resolve())
-
-
 def main():
     parser = argparse.ArgumentParser(description="OpenCode RL Pipeline (Fixed-Stage)")
     parser.add_argument("--benchmark", type=str, default="gsm8k",
@@ -55,15 +29,16 @@ def main():
     parser.add_argument("--max-agent-steps", type=int, default=25)
     parser.add_argument("--max-fix-retries", type=int, default=20,
                         help="训练失败后最大修复重试次数")
-    parser.add_argument("--max-rollout-repair-retries", type=int, default=2,
-                        help="Rollout 全零 reward 时最大自动修复重试次数")
-
-    parser.add_argument("--fsm-target-repo", type=str, default="")
-    parser.add_argument("--fsm-deploy-engine", type=str, default=None,
-                        choices=["vllm", "tgi", "local"])
-    parser.add_argument("--fsm-repair-iters", type=int, default=3)
-    parser.add_argument("--fsm-mode", type=str, default=None,
-                        choices=["smoke", "full"])
+    parser.add_argument("--max-eval-repair-retries", type=int, default=2,
+                        help="--eval-only 全零 reward 时最大自动修复重试次数")
+    parser.add_argument("--resume", action="store_true",
+                        help="从上次 checkpoint 断点续跑（需指定 --run-dir）")
+    parser.add_argument("--stale-timeout", type=int, default=180,
+                        help="LLM 无响应超时秒数，超过后自动重试（默认 180）")
+    parser.add_argument("--max-verifier-retries", type=int, default=2,
+                        help="Verifier 生成内部最大重试次数（默认 2）")
+    parser.add_argument("--http-timeout", type=int, default=300,
+                        help="OpenCode HTTP 请求超时秒数（默认 300）")
 
     parser.add_argument("--list-benchmarks", action="store_true",
                         help="列出所有可用 benchmark 并退出")
@@ -105,11 +80,6 @@ def main():
     os.environ["OUTPUT_DIR"] = output_dir
     os.environ["TRAINING_TIMEOUT"] = str(args.training_timeout)
 
-    fsm_target = args.fsm_target_repo or os.environ.get("FSM_TARGET_REPO", "") or run_dir
-
-    project_root = Path(__file__).resolve().parent
-    _init_fsm_workspace(project_root, Path(fsm_target))
-
     data_link = Path(run_dir) / "data"
     if not data_link.exists():
         data_link.symlink_to(Path(data_path).resolve())
@@ -121,10 +91,7 @@ def main():
             shutil.copy2(src_desc, dst_desc)
 
     fsm_config = {
-        "target_repo": fsm_target,
-        "deploy_engine": args.fsm_deploy_engine or os.environ.get("FSM_DEPLOY_ENGINE", "vllm"),
-        "repair_iters": args.fsm_repair_iters,
-        "mode": args.fsm_mode or os.environ.get("FSM_MODE", "smoke"),
+        "target_repo": run_dir,
         "opencode_url": os.environ.get("OPENCODE_URL", ""),
         "opencode_model": os.environ.get("OPENCODE_MODEL", ""),
     }
@@ -139,8 +106,12 @@ def main():
         training_timeout=args.training_timeout,
         max_agent_steps=args.max_agent_steps,
         max_fix_retries=args.max_fix_retries,
-        max_rollout_repair_retries=args.max_rollout_repair_retries,
+        max_eval_repair_retries=args.max_eval_repair_retries,
         fsm_config=fsm_config,
+        resume=args.resume,
+        stale_timeout=args.stale_timeout,
+        max_verifier_retries=args.max_verifier_retries,
+        http_timeout=args.http_timeout,
     )
 
 

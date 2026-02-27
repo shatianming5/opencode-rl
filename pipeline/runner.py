@@ -1,21 +1,52 @@
-"""Pipeline 主循环：编排 code_gen → training → FSM deploy/rollout/evaluate → 迭代。"""
+"""Pipeline 主循环：状态机 + 断点续跑 + 两阶段分离验证。
+
+阶段流程：
+  Phase 0: VERIFY_GEN（仅第一轮，生成 verifier.py 并锁定）
+  每轮迭代:
+    CODE_GEN → TRAINING → EVAL_GENERATE → VERIFY → ANALYSIS → COMPLETE
+"""
 
 import json
 import os
-import threading
 import time
 from pathlib import Path
 
 from .phases import (
     phase_analysis,
     phase_code_generation,
+    phase_eval_generate,
     phase_fix_training,
     phase_training,
+    phase_verifier_generation,
 )
-from .types import IterationResult
-from .prompts import build_scaffold_prompt, build_rollout_repair_prompt
+from .prompts import build_eval_repair_prompt
+from .state import load_checkpoint, save_checkpoint
 from .stream import make_stream_printer
+from .types import (
+    IterationResult,
+    IterationState,
+    Phase,
+    PhaseResult,
+    PipelineState,
+)
+from .ui import (
+    console,
+    print_data_gpu_info,
+    print_iteration_header,
+    print_iteration_summary,
+    print_phase_header,
+    print_phase_status,
+    print_pipeline_footer,
+    print_pipeline_header,
+    print_verification_report,
+)
 from .utils import count_samples_jsonl, get_data_stats, get_gpu_info
+from .verification import (
+    check_verifier_integrity,
+    compute_sha256,
+    run_verification,
+    validate_verifier,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -23,6 +54,8 @@ from .utils import count_samples_jsonl, get_data_stats, get_gpu_info
 # ---------------------------------------------------------------------------
 _LOG_TRUNCATE = 20000
 _ERR_TRUNCATE = 4000
+_MAX_VERIFIER_RETRIES = 2
+_MAX_PHASE0_OUTER_RETRIES = 50  # Phase 0 外层最大重试次数，防止永挂
 
 
 # ---------------------------------------------------------------------------
@@ -32,7 +65,6 @@ def _normalize_score(raw) -> float | None:
     """将 [0,1] 的原始分数归一化为 [0,100] 百分制。"""
     if raw is None or not isinstance(raw, (int, float)):
         return None
-    # 阈值 1.05：容忍浮点误差（如 1.001），但已是百分制的（如 50.0）不再缩放
     return round(raw * 100, 2) if raw <= 1.05 else raw
 
 
@@ -64,42 +96,45 @@ def _run_opencode_agent(
     max_turns: int = 30,
     session_title: str = "",
     log_name: str = "agent",
-    fsm_state: str = "S0_SCAFFOLD",
-    purpose: str = "scaffold_contract",
+    fsm_state: str = "S0_EVAL_REPAIR",
+    purpose: str = "eval_repair",
     label: str = "Agent",
+    stale_timeout: float = 180.0,
+    http_timeout: float = 300.0,
 ) -> bool:
     """通用 OpenCodeClient 执行器。返回 True 如果 agent 正常完成。"""
     try:
         from runner_fsm.opencode.client import OpenCodeClient
     except ImportError:
-        print(f"  {label}: runner_fsm not available, skipping")
+        console.print(f"  [dim]{label}: runner_fsm not available, skipping[/]")
         return False
 
     target_repo = fsm_config.get("target_repo", ".")
     repo_root = Path(target_repo).resolve()
     model, base_url = _resolve_opencode_config(fsm_config)
 
-    out_dir = repo_root / ".opencode_fsm" / "scaffold_logs"
+    out_dir = repo_root / "code" / "agent_logs"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"  Prompt: {len(prompt)} chars, starting OpenCode server...", flush=True)
+    console.print(f"  [dim]Prompt:[/] {len(prompt)} chars  [dim]Starting server...[/]")
     try:
         agent = OpenCodeClient(
             repo=repo_root,
             plan_rel="PLAN.md",
-            pipeline_rel="pipeline.yml",
+            pipeline_rel=None,
             model=model,
             base_url=base_url,
-            timeout_seconds=600,
-            bash_mode="restricted",
+            timeout_seconds=http_timeout,
+            bash_mode="full",
             scaffold_bash_mode="full",
             unattended="strict",
             max_turns=max_turns,
             server_log_path=out_dir / f"{log_name}.log",
             session_title=session_title,
+            stale_timeout=stale_timeout,
         )
     except Exception as e:
-        print(f"  {label}: failed to create OpenCodeClient: {e}")
+        console.print(f"  [bold red]{label}: failed to create OpenCodeClient:[/] {e}")
         return False
 
     try:
@@ -110,14 +145,14 @@ def _run_opencode_agent(
             purpose=purpose,
             on_turn=make_stream_printer(label),
         )
-        print(f"  {label}: agent completed")
+        console.print(f"  [green]{label}: agent completed[/]")
         if result.assistant_text:
             (out_dir / f"{log_name}_result.txt").write_text(
                 result.assistant_text[-_LOG_TRUNCATE:], encoding="utf-8",
             )
         return True
     except Exception as e:
-        print(f"  {label}: agent error: {e}")
+        console.print(f"  [bold red]{label}: agent error:[/] {e}")
         (out_dir / f"{log_name}_error.txt").write_text(
             str(e)[:_ERR_TRUNCATE], encoding="utf-8",
         )
@@ -129,420 +164,10 @@ def _run_opencode_agent(
             pass
 
 
-# ---------------------------------------------------------------------------
-# FSM 进度监控
-# ---------------------------------------------------------------------------
-class _FSMProgressMonitor:
-    """后台线程，定时扫描 FSM artifacts 目录显示进度。"""
-
-    def __init__(self, label: str, target_repo: str, total_samples: int = 0,
-                 interval: float = 15.0, is_evaluate: bool = False):
-        self._label = label
-        self._target_repo = Path(target_repo).resolve()
-        self._total = total_samples
-        self._interval = interval
-        self._is_evaluate = is_evaluate
-        self._stop = threading.Event()
-        self._start_time = time.time()
-        self._thread: threading.Thread | None = None
-        self._last_metrics_mtime: float = 0
-        self._last_log_size: int = 0
-
-    def _find_samples_jsonl(self) -> Path | None:
-        candidates = [
-            self._target_repo / ".opencode_fsm" / "artifacts" / "samples.jsonl",
-            self._target_repo / ".opencode_fsm" / "samples.jsonl",
-        ]
-        rollout_json = self._target_repo / ".opencode_fsm" / "rollout.json"
-        if rollout_json.exists():
-            try:
-                obj = json.loads(rollout_json.read_text())
-                p = (obj.get("paths") or {}).get("samples_jsonl") or obj.get("samples_jsonl")
-                if p:
-                    candidates.insert(0, Path(p))
-            except Exception:
-                pass
-        for c in candidates:
-            if c.exists():
-                return c
-        return None
-
-    def _read_metrics(self) -> dict | None:
-        metrics_path = self._target_repo / ".opencode_fsm" / "metrics.json"
-        if not metrics_path.exists():
-            return None
-        try:
-            mtime = metrics_path.stat().st_mtime
-            if mtime > self._last_metrics_mtime:
-                self._last_metrics_mtime = mtime
-                return json.loads(metrics_path.read_text())
-        except Exception:
-            pass
-        return None
-
-    def _tail_eval_log(self, max_lines: int = 3) -> str | None:
-        log_candidates = [
-            self._target_repo / ".opencode_fsm" / "eval.log",
-            self._target_repo / ".opencode_fsm" / "evaluation.log",
-        ]
-        artifacts = self._target_repo / ".opencode_fsm" / "artifacts"
-        if artifacts.exists():
-            for log_file in sorted(artifacts.rglob("*.log"), key=lambda p: p.stat().st_mtime, reverse=True):
-                log_candidates.insert(0, log_file)
-                break
-        for log_path in log_candidates:
-            if not log_path.exists():
-                continue
-            try:
-                size = log_path.stat().st_size
-                if size <= self._last_log_size:
-                    continue
-                self._last_log_size = size
-                with open(log_path, "r", encoding="utf-8", errors="replace") as f:
-                    lines = f.readlines()
-                tail = [l.rstrip() for l in lines[-max_lines:] if l.strip()]
-                if tail:
-                    return " | ".join(tail)
-            except Exception:
-                pass
-        return None
-
-    def _tick(self):
-        elapsed = time.time() - self._start_time
-
-        if self._is_evaluate:
-            metrics = self._read_metrics()
-            if metrics:
-                score = metrics.get("accuracy", metrics.get("score", "?"))
-                passed = metrics.get("pass_count", "?")
-                total = metrics.get("total", "?")
-                print(f"  [{self._label}] {elapsed:.0f}s | score={score}, passed={passed}/{total}", flush=True)
-                return
-            log_tail = self._tail_eval_log()
-            if log_tail:
-                if len(log_tail) > 120:
-                    log_tail = log_tail[:117] + "..."
-                print(f"  [{self._label}] {elapsed:.0f}s | {log_tail}", flush=True)
-                return
-
-        samples_path = self._find_samples_jsonl()
-        if samples_path:
-            done, passed = count_samples_jsonl(str(samples_path))
-            total_str = f"/{self._total}" if self._total else ""
-            pct = f" ({done/self._total*100:.0f}%)" if self._total and done else ""
-            print(f"  [{self._label}] {elapsed:.0f}s | {done}{total_str} samples{pct}, {passed} passed", flush=True)
-        else:
-            artifacts = self._target_repo / ".opencode_fsm" / "artifacts"
-            runtime = self._target_repo / ".opencode_fsm" / "runtime_env.json"
-            if runtime.exists():
-                print(f"  [{self._label}] {elapsed:.0f}s | model deployed, generating...", flush=True)
-            elif artifacts.exists():
-                print(f"  [{self._label}] {elapsed:.0f}s | preparing...", flush=True)
-            else:
-                print(f"  [{self._label}] {elapsed:.0f}s | waiting...", flush=True)
-
-    def _run(self):
-        while not self._stop.wait(self._interval):
-            self._tick()
-
-    def start(self):
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
-        return self
-
-    def stop(self):
-        self._stop.set()
-        if self._thread:
-            self._thread.join(timeout=2)
-        self._tick()
-
-    def __enter__(self):
-        return self.start()
-
-    def __exit__(self, *_):
-        self.stop()
-
-
-# ---------------------------------------------------------------------------
-# FSM 核心函数
-# ---------------------------------------------------------------------------
-def _create_fsm_session(fsm_config: dict):
-    """创建 FSM EnvSession。"""
-    try:
-        from runner_fsm.env import setup
-    except ImportError:
-        from runner.env import setup
-
-    session = setup(
-        target=fsm_config.get("target_repo", "."),
-        require_metrics=True,
-        audit="warn-only",
-        use_cache=fsm_config.get("cache_enabled", True),
-        opencode_model=fsm_config.get("opencode_model", ""),
-        opencode_url=fsm_config.get("opencode_url", ""),
-        unattended="strict",
-        strict_opencode=True,
-        opencode_timeout_seconds=600,
-    )
-    session.command_hints = []
-    session.hint_anchors = []
-    return session
-
-
-def _build_fsm_env_overrides(
-    model_path: str,
-    deploy_engine: str,
-    data_path: str = "",
-    output_dir: str = "",
-) -> dict[str, str]:
-    """构建传递给 FSM stage 脚本的环境变量。"""
-    overrides: dict[str, str] = {"TRAINED_MODEL_PATH": str(model_path), "DEPLOY_ENGINE": deploy_engine}
-    if data_path:
-        overrides["DATA_PATH"] = data_path
-    if output_dir:
-        overrides["OUTPUT_DIR"] = output_dir
-    for key in ("OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_API_BASE",
-                 "MODEL_PATH", "CUDA_VISIBLE_DEVICES"):
-        val = os.environ.get(key, "")
-        if val:
-            overrides[key] = val
-    for key in ("DATA_PATH", "OUTPUT_DIR"):
-        if key not in overrides:
-            val = os.environ.get(key, "")
-            if val:
-                overrides[key] = val
-    return overrides
-
-
-def _extract_samples_path(rollout_path, target_repo: str) -> str | None:
-    """从 rollout.json 中提取 samples.jsonl 路径。"""
-    if rollout_path is None:
-        return None
-    try:
-        with open(rollout_path, "r", encoding="utf-8") as f:
-            obj = json.load(f)
-    except Exception:
-        return None
-    if not isinstance(obj, dict):
-        return None
-    paths = obj.get("paths")
-    if isinstance(paths, dict):
-        raw = paths.get("samples_jsonl")
-        if isinstance(raw, str) and raw.strip():
-            p = Path(raw.strip())
-            if p.exists():
-                return str(p)
-            repo = Path(target_repo).resolve()
-            candidate = (repo / p).resolve()
-            if candidate.exists():
-                return str(candidate)
-    return None
-
-
-def _compute_score_from_samples(samples_path: str) -> dict | None:
-    """直接从 rollout 的 samples.jsonl 计算 pass@1 score。"""
-    total, pass_count = count_samples_jsonl(samples_path)
-    if total == 0:
-        return None
-    accuracy = pass_count / total
-    print(f"  [samples fallback] {pass_count}/{total} = {accuracy:.4f}")
-    return {
-        "ok": True,
-        "score": accuracy,
-        "pass_count": pass_count,
-        "total": total,
-        "source": "samples_direct",
-    }
-
-
-def _read_fsm_metrics(target_repo: str, max_age_seconds: int = 600) -> dict | None:
-    """Fallback: 直接读 FSM 产出的 metrics.json。"""
-    metrics_path = Path(target_repo) / ".opencode_fsm" / "metrics.json"
-    if not metrics_path.exists():
-        return None
-    try:
-        age = time.time() - metrics_path.stat().st_mtime
-        if age > max_age_seconds:
-            print(f"  FSM fallback: metrics.json too old ({age:.0f}s), skipping")
-            return None
-        data = json.loads(metrics_path.read_text())
-        if not isinstance(data, dict):
-            return None
-        score = data.get("accuracy") if "accuracy" in data else data.get("score")
-        if score is not None:
-            return {"ok": True, "score": score, "source": "metrics_fallback"}
-    except Exception:
-        pass
-    return None
-
-
-def _try_fsm_deploy_and_rollout(
-    workspace: str,
-    model_path: str,
-    fsm_config: dict,
-    session,
-    data_path: str = "",
-    output_dir: str = "",
-) -> dict | None:
-    """通过 FSM-Runner 部署模型并执行 rollout 采样。"""
-    print(f"\n{'='*60}")
-    print(f"  Phase FSM: Deploy + Rollout")
-    print(f"{'='*60}")
-
-    model_dir = Path(model_path).resolve()
-    if not model_dir.exists():
-        return {"ok": False, "reason": f"model_path_not_found: {model_dir}"}
-
-    env_overrides = _build_fsm_env_overrides(
-        model_path, fsm_config.get("deploy_engine", "vllm"), data_path, output_dir,
-    )
-
-    # 获取数据总量用于进度显示
-    total_samples = 0
-    dp = data_path or os.environ.get("DATA_PATH", "")
-    if dp:
-        p = Path(dp) / "train.jsonl"
-        if p.exists():
-            with open(p, "r") as f:
-                total_samples = sum(1 for _ in f)
-
-    target_repo = fsm_config.get("target_repo", ".")
-    try:
-        with _FSMProgressMonitor("FSM Rollout", target_repo, total_samples):
-            rollout_result = session.rollout(
-                llm=model_dir,
-                mode=fsm_config.get("mode", "smoke"),
-                require_samples=True,
-                env_overrides=env_overrides,
-                repair_iters=fsm_config.get("repair_iters", 3),
-            )
-    except Exception as e:
-        print(f"  FSM rollout error: {e}")
-        return {"ok": False, "reason": f"rollout_exception: {e}"}
-
-    if not rollout_result.ok:
-        verify = rollout_result.verify
-        failed = getattr(verify, "failed_stage", "unknown") if verify else "unknown"
-        print(f"  FSM rollout failed: stage={failed}")
-        return {"ok": False, "reason": f"rollout_failed: stage={failed}"}
-
-    samples_path = _extract_samples_path(rollout_result.rollout_path, target_repo)
-    print(f"  FSM rollout OK: samples={samples_path}")
-    return {
-        "ok": True,
-        "samples_path": samples_path or "",
-        "rollout_path": str(rollout_result.rollout_path or ""),
-        "artifacts_dir": str(rollout_result.artifacts_dir),
-    }
-
-
-def _try_fsm_evaluate(
-    workspace: str,
-    model_path: str,
-    fsm_config: dict,
-    session,
-    data_path: str = "",
-    output_dir: str = "",
-) -> dict | None:
-    """通过 FSM-Runner 执行评测。"""
-    print(f"\n{'='*60}")
-    print(f"  Phase FSM: Evaluate")
-    print(f"{'='*60}")
-
-    env_overrides = _build_fsm_env_overrides(
-        model_path, fsm_config.get("deploy_engine", "vllm"), data_path, output_dir,
-    )
-
-    target_repo = fsm_config.get("target_repo", ".")
-    llm_arg = Path(model_path) if model_path else None
-    try:
-        with _FSMProgressMonitor("FSM Evaluate", target_repo, is_evaluate=True):
-            eval_result = session.evaluate(
-                llm=llm_arg,
-                mode=fsm_config.get("mode", "smoke"),
-                env_overrides=env_overrides or None,
-                repair_iters=fsm_config.get("repair_iters", 3),
-            )
-    except Exception as e:
-        print(f"  FSM evaluate error: {e}")
-        return {"ok": False, "reason": f"evaluate_exception: {e}"}
-
-    if not eval_result.ok:
-        verify = eval_result.verify
-        failed = getattr(verify, "failed_stage", "unknown") if verify else "unknown"
-        print(f"  FSM evaluate failed: stage={failed}")
-        fallback = _read_fsm_metrics(target_repo)
-        if fallback:
-            print(f"  FSM fallback OK: score={fallback['score']}")
-            return fallback
-        return {"ok": False, "reason": f"evaluate_failed: stage={failed}"}
-
-    metrics = eval_result.metrics or {}
-    score = metrics.get("score")
-    print(f"  FSM evaluate OK: score={score}")
-    return {
-        "ok": True,
-        "score": score,
-        "metrics": metrics,
-        "metrics_path": str(eval_result.metrics_path or ""),
-    }
-
-
-def _scaffold_fsm_evaluation(
-    workspace: str,
-    task_description: str,
-    fsm_config: dict,
-    data_path: str = "",
-) -> bool:
-    """在迭代循环之前，调用 OpenCode 自主探索数据并生成 task-specific 的评测脚本。"""
-    target_repo = fsm_config.get("target_repo", ".")
-    repo_root = Path(target_repo).resolve()
-
-    print(f"\n{'='*60}")
-    print(f"  Phase FSM-Scaffold: Adapting evaluation for task")
-    print(f"{'='*60}")
-
-    sample_count = 0
-    if data_path:
-        p = Path(data_path) / "train.jsonl"
-        if p.exists():
-            with open(p, "r") as f:
-                sample_count = sum(1 for _ in f)
-
-    prompt = build_scaffold_prompt(task_description, data_path, sample_count)
-
-    ok = _run_opencode_agent(
-        fsm_config, prompt,
-        max_turns=40,
-        session_title="scaffold_evaluation",
-        log_name="opencode_scaffold",
-        fsm_state="S0_SCAFFOLD",
-        purpose="scaffold_contract",
-        label="Scaffold",
-    )
-
-    if not ok:
-        return False
-
-    # 验证 scaffold 实际重写了 rollout.sh
-    rollout_sh = repo_root / ".opencode_fsm" / "stages" / "rollout.sh"
-    if not rollout_sh.exists():
-        print("  WARNING: rollout.sh not found after scaffold")
-        return False
-    content = rollout_sh.read_text(encoding="utf-8")
-    if "# SKELETON" in content and "reward = 0.0" in content:
-        print("  WARNING: rollout.sh still contains skeleton placeholder")
-        return False
-    if "reward" not in content.lower():
-        print("  WARNING: rollout.sh missing eval reward logic after scaffold")
-        return False
-    print(f"  Scaffold verification OK: rollout.sh rewritten ({len(content)} bytes)")
-    return True
-
-
-def _repair_rollout_zero_reward(
+def _repair_eval_zero_reward(
     workspace: str,
     fsm_config: dict,
+    code_path: str,
     samples_path: str,
     task_description: str,
     data_path: str,
@@ -550,13 +175,15 @@ def _repair_rollout_zero_reward(
     total_samples: int,
     repair_attempt: int,
     max_attempts: int,
+    eval_log: str = "",
+    stale_timeout: float = 180.0,
+    http_timeout: float = 300.0,
 ) -> bool:
-    """调用 OpenCode 自主诊断并修复 rollout.sh 中的评测 reward 逻辑。"""
-    print(f"\n{'='*60}")
-    print(f"  Rollout Repair: attempt {repair_attempt}/{max_attempts}")
-    print(f"{'='*60}")
+    """调用 OpenCode 自主诊断并修复 train.py 的 --eval-only 评测逻辑。"""
+    print_phase_header("Eval Repair", f"attempt {repair_attempt}/{max_attempts}")
 
-    prompt = build_rollout_repair_prompt(
+    prompt = build_eval_repair_prompt(
+        code_path=code_path,
         samples_path=samples_path,
         data_path=data_path,
         task_description=task_description,
@@ -564,17 +191,391 @@ def _repair_rollout_zero_reward(
         total_samples=total_samples,
         repair_attempt=repair_attempt,
         max_attempts=max_attempts,
+        eval_log=eval_log,
     )
 
     return _run_opencode_agent(
         fsm_config, prompt,
         max_turns=30,
-        session_title=f"rollout_repair_{repair_attempt}",
-        log_name=f"opencode_rollout_repair_{repair_attempt}",
-        fsm_state="S0_SCAFFOLD",
-        purpose="repair_contract",
-        label="RolloutRepair",
+        session_title=f"eval_repair_{repair_attempt}",
+        log_name=f"opencode_eval_repair_{repair_attempt}",
+        label="EvalRepair",
+        stale_timeout=stale_timeout,
+        http_timeout=http_timeout,
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase 0: 验证器生成与锁定
+# ---------------------------------------------------------------------------
+def _run_phase_verify_gen(
+    state: PipelineState,
+    task_description: str,
+    opencode_model: str,
+    opencode_url: str,
+    stale_timeout: float = 180.0,
+    max_verifier_retries: int = _MAX_VERIFIER_RETRIES,
+    http_timeout: float = 300.0,
+) -> PhaseResult:
+    """执行 Phase 0：生成 verifier.py，验证，锁定。"""
+    workspace = state.workspace
+    data_path = state.data_path
+    verifier_path = str(Path(workspace) / "code" / "verifier.py")
+
+    for attempt in range(max_verifier_retries + 1):
+        if attempt > 0:
+            console.print(f"\n  [yellow]Verifier retry {attempt}/{max_verifier_retries}[/]")
+
+        # 生成 verifier.py
+        gen_result = phase_verifier_generation(
+            workspace=workspace,
+            data_path=data_path,
+            task_description=task_description,
+            max_agent_steps=state.max_agent_steps,
+            opencode_model=opencode_model,
+            opencode_url=opencode_url,
+            stale_timeout=stale_timeout,
+            http_timeout=http_timeout,
+        )
+        if not gen_result.success:
+            console.print(f"  [red]Verifier generation failed:[/] {gen_result.error}")
+            if attempt < max_verifier_retries:
+                continue
+            return gen_result
+
+        # 验证 verifier.py 的正确性
+        ok, err = validate_verifier(verifier_path, data_path)
+        if ok:
+            # 锁定：计算 SHA256，备份内容
+            sha256 = compute_sha256(verifier_path)
+            backup = Path(verifier_path).read_text(encoding="utf-8")
+            state.verifier_sha256 = sha256
+            state.verifier_backup = backup
+
+            console.print(f"  [green]Verifier validated and locked[/] [dim](SHA256: {sha256[:16]}...)[/]")
+            return PhaseResult(
+                success=True, phase="verify_gen",
+                payload={
+                    "verifier_path": verifier_path,
+                    "sha256": sha256,
+                },
+            )
+        else:
+            console.print(f"  [red]Verifier validation failed:[/] {err}")
+            if attempt < max_verifier_retries:
+                continue
+            return PhaseResult(
+                success=False, phase="verify_gen",
+                error=f"Verifier validation failed after {max_verifier_retries + 1} attempts: {err}",
+            )
+
+    return PhaseResult(success=False, phase="verify_gen", error="Exhausted retries")
+
+
+# ---------------------------------------------------------------------------
+# 迭代内各阶段
+# ---------------------------------------------------------------------------
+def _run_phase_code_gen(
+    state: PipelineState,
+    iter_state: IterationState,
+    history: list[IterationResult],
+    task_description: str,
+    gpu_info: dict,
+    opencode_model: str,
+    opencode_url: str,
+    stale_timeout: float = 180.0,
+    http_timeout: float = 300.0,
+) -> PhaseResult:
+    """CODE_GEN 阶段。"""
+    result = phase_code_generation(
+        iteration=iter_state.iteration,
+        workspace=state.workspace,
+        base_model=state.base_model,
+        task_description=task_description,
+        history=history,
+        max_agent_steps=state.max_agent_steps,
+        gpu_info=gpu_info,
+        opencode_model=opencode_model,
+        opencode_url=opencode_url,
+        stale_timeout=stale_timeout,
+        http_timeout=http_timeout,
+    )
+    if result.success:
+        iter_state.code_path = result.payload.get("code_path", "")
+    else:
+        iter_state.code_path = str(Path(state.workspace) / "code" / "train.py")
+    return result
+
+
+def _run_phase_training(
+    state: PipelineState,
+    iter_state: IterationState,
+    opencode_model: str,
+    opencode_url: str,
+    stale_timeout: float = 180.0,
+    http_timeout: float = 300.0,
+) -> PhaseResult:
+    """TRAINING 阶段（含重试循环）。"""
+    code_path = iter_state.code_path
+    workspace = state.workspace
+
+    train_result = phase_training(
+        workspace, code_path, timeout=state.training_timeout,
+    )
+
+    training_log_path = str(Path(workspace) / "code" / "training_stdout.log")
+    stdout = train_result.payload.get("stdout", "")
+    Path(training_log_path).write_text(stdout, encoding="utf-8")
+
+    total_time = train_result.payload.get("elapsed", 0.0)
+
+    for retry in range(state.max_fix_retries):
+        if train_result.success:
+            break
+        console.print(f"\n  [yellow]--- Fix retry {retry + 1}/{state.max_fix_retries} ---[/]")
+
+        fix_result = phase_fix_training(
+            code_path, training_log_path, state.data_path, workspace,
+            iteration=iter_state.iteration,
+            opencode_model=opencode_model,
+            opencode_url=opencode_url,
+            max_agent_steps=state.max_agent_steps,
+            stale_timeout=stale_timeout,
+            http_timeout=http_timeout,
+        )
+        if not fix_result.success:
+            console.print(f"  [red]Fix agent failed:[/] {fix_result.error}")
+            break
+
+        console.print(f"  [dim]Agent fix attempt done, re-running training...[/]")
+        train_result = phase_training(
+            workspace, code_path, timeout=state.training_timeout,
+        )
+        extra_time = train_result.payload.get("elapsed", 0.0)
+        total_time += extra_time
+        stdout = train_result.payload.get("stdout", "")
+        Path(training_log_path).write_text(stdout, encoding="utf-8")
+
+    exit_code = train_result.payload.get("exit_code", -1)
+    iter_state.exit_code = exit_code
+    iter_state.stdout = train_result.payload.get("stdout", "")
+    iter_state.training_time = total_time
+
+    return PhaseResult(
+        success=train_result.success,
+        phase="training",
+        payload={
+            "exit_code": exit_code,
+            "elapsed": total_time,
+        },
+        error=train_result.error,
+    )
+
+
+def _run_phase_eval_generate(
+    state: PipelineState,
+    iter_state: IterationState,
+    fsm_config: dict,
+    task_description: str,
+    stale_timeout: float = 180.0,
+    http_timeout: float = 300.0,
+) -> PhaseResult:
+    """EVAL_GENERATE 阶段（含零分修复循环）。"""
+    workspace = state.workspace
+    code_path = iter_state.code_path
+    output_dir = state.output_dir
+
+    for eval_attempt in range(state.max_eval_repair_retries + 1):
+        eval_result = phase_eval_generate(workspace, code_path)
+        eval_stdout = eval_result.payload.get("stdout", "")
+
+        # 保存评测日志
+        eval_log_path = Path(workspace) / "code" / "eval_stdout.log"
+        eval_log_path.write_text(eval_stdout, encoding="utf-8")
+
+        if not eval_result.success:
+            if eval_attempt < state.max_eval_repair_retries:
+                console.print(f"\n  [yellow]Eval crashed, attempting repair...[/]")
+                _repair_eval_zero_reward(
+                    workspace=workspace,
+                    fsm_config=fsm_config,
+                    code_path=code_path,
+                    samples_path="",
+                    task_description=task_description,
+                    data_path=state.data_path,
+                    pass_count=0,
+                    total_samples=0,
+                    repair_attempt=eval_attempt + 1,
+                    max_attempts=state.max_eval_repair_retries,
+                    eval_log=eval_stdout,
+                    stale_timeout=stale_timeout,
+                    http_timeout=http_timeout,
+                )
+                continue
+            return PhaseResult(
+                success=False, phase="eval_generate",
+                error="Eval crashed after all retries",
+            )
+
+        # 检查 samples.jsonl
+        samples_path = str(Path(output_dir) / "samples.jsonl")
+        if not Path(samples_path).exists():
+            console.print(f"  [bold yellow]WARNING:[/] {samples_path} not found after eval")
+            if eval_attempt < state.max_eval_repair_retries:
+                _repair_eval_zero_reward(
+                    workspace=workspace,
+                    fsm_config=fsm_config,
+                    code_path=code_path,
+                    samples_path="",
+                    task_description=task_description,
+                    data_path=state.data_path,
+                    pass_count=0,
+                    total_samples=0,
+                    repair_attempt=eval_attempt + 1,
+                    max_attempts=state.max_eval_repair_retries,
+                    eval_log=eval_stdout,
+                    stale_timeout=stale_timeout,
+                    http_timeout=http_timeout,
+                )
+                continue
+            return PhaseResult(
+                success=False, phase="eval_generate",
+                error="samples.jsonl not found after all retries",
+            )
+
+        iter_state.samples_path = samples_path
+
+        # 读取 Agent 自报分数（仅用于交叉验证）
+        total, pass_count = count_samples_jsonl(samples_path)
+        agent_score = pass_count / total if total > 0 else 0.0
+        console.print(f"  [dim]\\[samples][/] Agent self-reported: {pass_count}/{total} = {agent_score:.4f}")
+
+        if total == 0 and eval_attempt < state.max_eval_repair_retries:
+            console.print(f"\n  [yellow]No samples generated, attempting repair...[/]")
+            _repair_eval_zero_reward(
+                workspace=workspace,
+                fsm_config=fsm_config,
+                code_path=code_path,
+                samples_path=samples_path,
+                task_description=task_description,
+                data_path=state.data_path,
+                pass_count=0,
+                total_samples=0,
+                repair_attempt=eval_attempt + 1,
+                max_attempts=state.max_eval_repair_retries,
+                eval_log=eval_stdout,
+                stale_timeout=stale_timeout,
+            )
+            continue
+
+        return PhaseResult(
+            success=True, phase="eval_generate",
+            payload={
+                "samples_path": samples_path,
+                "agent_pass_count": pass_count,
+                "agent_total": total,
+                "agent_score": agent_score,
+            },
+        )
+
+    return PhaseResult(
+        success=False, phase="eval_generate",
+        error="Exhausted all eval repair retries",
+    )
+
+
+def _run_phase_verify(
+    state: PipelineState,
+    iter_state: IterationState,
+) -> PhaseResult:
+    """VERIFY 阶段：管线独立验证。不重试。"""
+    verifier_path = str(Path(state.workspace) / "code" / "verifier.py")
+    samples_path = iter_state.samples_path
+
+    if not state.verifier_sha256:
+        console.print(f"  [dim]\\[verify] No verifier locked, skipping independent verification[/]")
+        # 回退到 Agent 自报分数
+        total, pass_count = count_samples_jsonl(samples_path)
+        score = pass_count / total if total > 0 else 0.0
+        return PhaseResult(
+            success=True, phase="verify",
+            payload={"pipeline_score": score, "fallback": True},
+        )
+
+    # 检查 verifier 完整性
+    integrity_ok = check_verifier_integrity(
+        verifier_path, state.verifier_sha256, state.verifier_backup,
+    )
+    if not integrity_ok:
+        console.print(f"  [bold yellow]\\[verify] Verifier integrity check failed, using agent scores[/]")
+        total, pass_count = count_samples_jsonl(samples_path)
+        score = pass_count / total if total > 0 else 0.0
+        return PhaseResult(
+            success=True, phase="verify",
+            payload={"pipeline_score": score, "fallback": True},
+        )
+
+    # 运行独立验证
+    vr = run_verification(verifier_path, samples_path, state.data_path)
+
+    iter_state.verification = vr.to_dict()
+
+    return PhaseResult(
+        success=True, phase="verify",
+        payload={
+            "pipeline_score": vr.pipeline_score,
+            "agent_score": vr.agent_score,
+            "total": vr.total,
+            "passed": vr.passed,
+            "reward_agreement_rate": vr.reward_agreement_rate,
+            "reward_inflation": vr.reward_inflation,
+        },
+    )
+
+
+def _run_phase_analysis(
+    state: PipelineState,
+    iter_state: IterationState,
+    opencode_model: str,
+    opencode_url: str,
+    stale_timeout: float = 180.0,
+    http_timeout: float = 300.0,
+) -> PhaseResult:
+    """ANALYSIS 阶段。"""
+    workspace = state.workspace
+    training_log_path = str(Path(workspace) / "code" / "training_stdout.log")
+
+    # 构建验证摘要供 analysis prompt 使用
+    verification_summary = ""
+    if iter_state.verification:
+        v = iter_state.verification
+        verification_summary = (
+            f"总样本数: {v.get('total', 0)}\n"
+            f"通过（管线验证）: {v.get('passed', 0)}/{v.get('total', 0)} = {v.get('pipeline_score', 0):.4f}\n"
+            f"Agent 自报分数: {v.get('agent_score', 0):.4f}\n"
+            f"Reward 一致率: {v.get('reward_agreement_rate', 0) * 100:.2f}%\n"
+            f"Reward 注水量: {v.get('reward_inflation', 0):+.4f}"
+        )
+
+    result = phase_analysis(
+        iteration=iter_state.iteration,
+        workspace=workspace,
+        code_path=iter_state.code_path,
+        training_log_path=training_log_path,
+        score=iter_state.score,
+        samples_path=iter_state.samples_path,
+        opencode_model=opencode_model,
+        opencode_url=opencode_url,
+        max_agent_steps=state.max_agent_steps,
+        verification_summary=verification_summary,
+        stale_timeout=stale_timeout,
+        http_timeout=http_timeout,
+    )
+
+    if result.success:
+        iter_state.analysis = result.payload.get("analysis", "")
+
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -590,16 +591,19 @@ def run_pipeline(
     training_timeout: int = 3600,
     max_agent_steps: int = 25,
     max_fix_retries: int = 2,
-    max_rollout_repair_retries: int = 2,
+    max_eval_repair_retries: int = 2,
     fsm_config: dict | None = None,
+    resume: bool = False,
+    stale_timeout: int = 180,
+    max_verifier_retries: int = 2,
+    http_timeout: int = 300,
 ):
-    """运行固定阶段 Pipeline
+    """运行 Pipeline（状态机 + 断点续跑 + 两阶段分离验证）
 
-    每轮迭代：
-      Phase 1: Agent 写代码（探索数据 + 编写 train.py）
-      Phase 2: Pipeline 执行训练（subprocess）
-      Phase FSM: Deploy + Rollout + Evaluate
-      Phase Analysis: 记录结果，注入到下轮 prompt
+    阶段流程：
+      Phase 0: 验证器生成（仅第一轮前执行一次）
+      每轮迭代：
+        CODE_GEN → TRAINING → EVAL_GENERATE → VERIFY → ANALYSIS → COMPLETE
     """
     pipeline_start = time.time()
     fsm_config = fsm_config or {}
@@ -612,19 +616,37 @@ def run_pipeline(
     opencode_model = os.environ.get("OPENCODE_MODEL", "")
     opencode_url = os.environ.get("OPENCODE_URL", "")
 
-    print(f"{'#'*60}")
-    print(f"  OpenCode RL Pipeline (Fixed-Stage)")
-    print(f"{'#'*60}")
-    print(f"  Task: {task}")
-    print(f"  Model: {base_model}")
-    print(f"  Workspace: {workspace}")
-    print(f"  Data path: {data_path}")
-    print(f"  Output dir: {output_dir}")
-    print(f"  Max iterations: {max_iterations}")
-    print(f"  Training timeout: {training_timeout}s")
-    print(f"  Agent steps/iter: {max_agent_steps}")
-    print(f"  OpenCode model: {opencode_model}")
-    print()
+    # ----- 尝试恢复 checkpoint -----
+    state: PipelineState | None = None
+    if resume:
+        state = load_checkpoint(workspace)
+        if state:
+            console.print(f"  [green]Resuming from checkpoint:[/] iteration {state.current_iteration}")
+        else:
+            console.print(f"  [dim]No checkpoint found, starting fresh[/]")
+
+    if state is None:
+        state = PipelineState(
+            task=task,
+            base_model=base_model,
+            workspace=workspace,
+            data_path=data_path,
+            output_dir=output_dir,
+            max_iterations=max_iterations,
+            training_timeout=training_timeout,
+            max_agent_steps=max_agent_steps,
+            max_fix_retries=max_fix_retries,
+            max_eval_repair_retries=max_eval_repair_retries,
+            pipeline_start_time=pipeline_start,
+        )
+
+    print_pipeline_header(
+        task=task, base_model=base_model, workspace=workspace,
+        data_path=data_path, output_dir=output_dir,
+        max_iterations=max_iterations, training_timeout=training_timeout,
+        max_agent_steps=max_agent_steps, opencode_model=opencode_model,
+        resume=resume,
+    )
 
     task_description = ""
     for fname in ["description.md", "instructions.md"]:
@@ -634,217 +656,244 @@ def run_pipeline(
 
     if not task_description.strip():
         task_description = f"Benchmark: {task}\nTrain a language model using GRPO reinforcement learning.\n"
-        print(f"WARNING: No description.md found, using fallback: {task}")
+        console.print(f"  [bold yellow]WARNING:[/] No description.md found, using fallback: {task}")
 
     data_stats = get_data_stats(data_path)
     gpu_info = get_gpu_info()
-    print(f"  Data: {data_stats['count']} samples")
-    print(f"  GPU: {gpu_info['num_gpus']}x {gpu_info['gpu_name']}")
+    print_data_gpu_info(data_stats["count"], gpu_info["num_gpus"], gpu_info["gpu_name"])
 
+    # ----- Phase 0: 验证器生成（仅执行一次，必须成功）-----
+    if not state.verifier_sha256:
+        print_phase_header("Phase 0: Verifier Generation", "generate & lock verifier.py")
+
+        vg_attempt = 0
+        while vg_attempt < _MAX_PHASE0_OUTER_RETRIES:
+            vg_attempt += 1
+            vg_result = _run_phase_verify_gen(
+                state, task_description, opencode_model, opencode_url,
+                stale_timeout=stale_timeout,
+                max_verifier_retries=max_verifier_retries,
+                http_timeout=http_timeout,
+            )
+            if vg_result.success:
+                save_checkpoint(state)
+                break
+            else:
+                console.print(f"  [bold yellow]Verifier generation failed (attempt {vg_attempt}/{_MAX_PHASE0_OUTER_RETRIES}):[/] {vg_result.error}")
+                console.print(f"  [dim]Retrying... (verifier is required, will not skip)[/]")
+        else:
+            raise RuntimeError(
+                f"Phase 0 failed after {_MAX_PHASE0_OUTER_RETRIES} outer retries. "
+                f"Last error: {vg_result.error}"
+            )
+    else:
+        print_phase_status(f"Verifier already locked (SHA256: {state.verifier_sha256[:16]}...)", "green")
+
+    # ----- 构建历史（从 state.iterations 转换）-----
     history: list[IterationResult] = []
-    best_score: float | None = None
-    best_iteration = -1
+    for it in state.iterations:
+        if it.current_phase == Phase.COMPLETE.value:
+            history.append(IterationResult(
+                iteration=it.iteration,
+                exit_code=it.exit_code,
+                training_time=it.training_time,
+                score=it.score,
+                agent_score=it.agent_score,
+                model_path=it.model_path,
+                code_path=it.code_path,
+                samples_path=it.samples_path,
+                analysis=it.analysis,
+            ))
 
-    # Phase FSM-Scaffold: 在迭代开始前让 OpenCode 生成 task-specific 的评测脚本
-    if task_description.strip():
-        scaffold_ok = _scaffold_fsm_evaluation(workspace, task_description, fsm_config, data_path=data_path)
-        if not scaffold_ok:
-            print("  WARNING: scaffold failed — FSM evaluation may not work correctly")
+    # ----- 确定起始迭代 -----
+    start_iteration = state.current_iteration + 1 if state.current_iteration > 0 else 1
 
-    # 每轮迭代创建一个 FSM session，deploy + rollout + evaluate 共享
-    for iteration in range(1, max_iterations + 1):
+    # 如果 resume，检查是否有未完成的迭代
+    resume_phase: str | None = None
+    if resume and state.iterations:
+        last_iter = state.iterations[-1]
+        if last_iter.current_phase != Phase.COMPLETE.value:
+            # 从中断的阶段继续
+            start_iteration = last_iter.iteration
+            resume_phase = last_iter.current_phase
+            console.print(f"  [green]Resuming iteration {start_iteration} from phase: {resume_phase}[/]")
+
+    best_score = state.best_score
+    best_iteration = state.best_iteration
+
+    for iteration in range(start_iteration, max_iterations + 1):
         iter_start = time.time()
         elapsed_total = iter_start - pipeline_start
 
-        print(f"\n{'#'*60}")
-        print(f"  ITERATION {iteration}/{max_iterations}")
-        print(f"  Elapsed: {elapsed_total:.0f}s")
-        print(f"{'#'*60}")
+        print_iteration_header(iteration, max_iterations, elapsed_total)
 
-        result = IterationResult(iteration=iteration)
+        # 获取或创建 IterationState
+        if resume_phase and state.iterations and state.iterations[-1].iteration == iteration:
+            iter_state = state.iterations[-1]
+        else:
+            iter_state = IterationState(iteration=iteration)
+            state.iterations.append(iter_state)
 
-        # Phase 1: Code Generation
-        try:
-            code_path = phase_code_generation(
-                iteration, workspace, base_model,
-                task_description, history, max_agent_steps,
-                gpu_info=gpu_info,
-                opencode_model=opencode_model,
-                opencode_url=opencode_url,
-            )
-            result.code_path = code_path
-        except Exception as e:
-            print(f"  Code generation failed: {e}")
-            result.code_path = str(Path(workspace) / "code" / "train.py")
-            result.exit_code = -1
-            result.stdout = f"Code generation error: {e}"
-            history.append(result)
-            continue
+        state.current_iteration = iteration
 
-        # Phase 2: Training Execution（含重试）
-        exit_code, stdout, train_time = phase_training(
-            workspace, code_path, timeout=training_timeout,
-        )
+        # 确定起始阶段
+        phases_order = [
+            Phase.CODE_GEN, Phase.TRAINING, Phase.EVAL_GENERATE,
+            Phase.VERIFY, Phase.ANALYSIS, Phase.COMPLETE,
+        ]
 
-        training_log_path = str(Path(workspace) / "code" / "training_stdout.log")
-        Path(training_log_path).write_text(stdout, encoding="utf-8")
-
-        for retry in range(max_fix_retries):
-            if exit_code == 0:
-                break
-            print(f"\n  --- Fix retry {retry + 1}/{max_fix_retries} ---")
+        if resume_phase:
             try:
-                phase_fix_training(
-                    code_path, training_log_path, data_path, workspace,
-                    iteration=iteration,
-                    opencode_model=opencode_model,
-                    opencode_url=opencode_url,
-                    max_agent_steps=max_agent_steps,
+                start_phase_idx = [p.value for p in phases_order].index(resume_phase)
+            except ValueError:
+                start_phase_idx = 0
+            resume_phase = None  # 仅首轮有效
+        else:
+            start_phase_idx = 0
+
+        # ---- 状态机循环 ----
+        for phase_idx in range(start_phase_idx, len(phases_order)):
+            phase = phases_order[phase_idx]
+            iter_state.current_phase = phase.value
+
+            if phase == Phase.CODE_GEN:
+                result = _run_phase_code_gen(
+                    state, iter_state, history, task_description,
+                    gpu_info, opencode_model, opencode_url,
+                    stale_timeout=stale_timeout,
+                    http_timeout=http_timeout,
                 )
-                print(f"  Agent fix attempt done, re-running training...")
-            except Exception as e:
-                print(f"  Fix agent failed: {e}")
-                break
+                iter_state.phase_results["code_gen"] = result.to_dict()
+                save_checkpoint(state)
 
-            exit_code, stdout, extra_time = phase_training(
-                workspace, code_path, timeout=training_timeout,
-            )
-            train_time += extra_time
-            Path(training_log_path).write_text(stdout, encoding="utf-8")
+                if not result.success:
+                    console.print(f"  [red]Code generation failed:[/] {result.error}")
+                    iter_state.current_phase = Phase.COMPLETE.value
+                    save_checkpoint(state)
+                    break
 
-        result.exit_code = exit_code
-        result.stdout = stdout
-        result.training_time = train_time
+            elif phase == Phase.TRAINING:
+                # 检查 verifier 完整性（被篡改则自动恢复）
+                verifier_path = str(Path(workspace) / "code" / "verifier.py")
+                if state.verifier_sha256:
+                    integrity_ok = check_verifier_integrity(
+                        verifier_path, state.verifier_sha256, state.verifier_backup,
+                    )
+                    if not integrity_ok:
+                        console.print(f"  [bold yellow]WARNING:[/] verifier.py was tampered with and has been restored")
 
-        # Phase FSM: Deploy + Rollout + Evaluate（含零分自动修复循环）
-        trained_model = ""
-        cached_samples_score: dict | None = None
+                result = _run_phase_training(
+                    state, iter_state, opencode_model, opencode_url,
+                    stale_timeout=stale_timeout,
+                    http_timeout=http_timeout,
+                )
+                iter_state.phase_results["training"] = result.to_dict()
+                save_checkpoint(state)
 
-        if exit_code == 0:
-            trained_model = _find_trained_model(output_dir)
+                if not result.success:
+                    console.print(f"  [red]Training failed after all retries[/]")
+                    iter_state.current_phase = Phase.COMPLETE.value
+                    save_checkpoint(state)
+                    break
 
-            # 创建单个 FSM session，本迭代内复用
-            try:
-                session = _create_fsm_session(fsm_config)
-            except ImportError:
-                print("  FSM runner not available, skipping FSM stages")
-                session = None
+            elif phase == Phase.EVAL_GENERATE:
+                result = _run_phase_eval_generate(
+                    state, iter_state, fsm_config, task_description,
+                    stale_timeout=stale_timeout,
+                    http_timeout=http_timeout,
+                )
+                iter_state.phase_results["eval_generate"] = result.to_dict()
+                save_checkpoint(state)
 
-            if session:
-                for rollout_attempt in range(max_rollout_repair_retries + 1):
-                    fsm_result = _try_fsm_deploy_and_rollout(
-                        workspace, trained_model, fsm_config, session,
-                        data_path=data_path, output_dir=output_dir,
+                if not result.success:
+                    console.print(f"  [red]Eval generation failed:[/] {result.error}")
+                    # 跳过 VERIFY 和 ANALYSIS
+                    iter_state.current_phase = Phase.COMPLETE.value
+                    save_checkpoint(state)
+                    break
+
+                iter_state.agent_score = _normalize_score(
+                    result.payload.get("agent_score")
+                )
+
+            elif phase == Phase.VERIFY:
+                result = _run_phase_verify(state, iter_state)
+                iter_state.phase_results["verify"] = result.to_dict()
+
+                pipeline_score = result.payload.get("pipeline_score", 0.0)
+                eval_score = _normalize_score(pipeline_score)
+
+                if eval_score is not None:
+                    passed = result.payload.get("passed", 0)
+                    total = result.payload.get("total", 0)
+                    agent_s = result.payload.get("agent_score", 0.0)
+                    agreement = result.payload.get("reward_agreement_rate", 0.0)
+                    inflation = result.payload.get("reward_inflation", 0.0)
+                    is_fallback = bool(result.payload.get("fallback"))
+
+                    print_verification_report(
+                        pipeline_score=pipeline_score,
+                        agent_score=agent_s,
+                        passed=passed, total=total,
+                        agreement_rate=agreement,
+                        inflation=inflation,
+                        fallback=is_fallback,
                     )
 
-                    if not fsm_result or not fsm_result.get("ok"):
-                        break
+                    iter_state.score = eval_score
+                    iter_state.model_path = _find_trained_model(output_dir)
+                    if best_score is None or eval_score > best_score:
+                        best_score = eval_score
+                        best_iteration = iteration
+                else:
+                    print_phase_status("No score available", "dim")
 
-                    samples_path = fsm_result.get("samples_path", "")
-                    result.samples_path = samples_path
+                state.best_score = best_score
+                state.best_iteration = best_iteration
+                save_checkpoint(state)
 
-                    # 计算 pass_count（结果缓存供 evaluation 阶段复用）
-                    if samples_path:
-                        cached_samples_score = _compute_score_from_samples(samples_path)
-                    else:
-                        cached_samples_score = None
-
-                    pass_count = 0
-                    total = 0
-                    if cached_samples_score and cached_samples_score.get("ok"):
-                        pass_count = cached_samples_score.get("pass_count", 0)
-                        total = cached_samples_score.get("total", 0)
-
-                    if pass_count > 0 or rollout_attempt >= max_rollout_repair_retries:
-                        break
-
-                    # 评测通过率为零 → 调用 OpenCode 自主修复评测逻辑
-                    print(f"\n  All {total} samples got eval reward=0.0, attempting auto-repair...")
-                    repair_ok = _repair_rollout_zero_reward(
-                        workspace=workspace,
-                        fsm_config=fsm_config,
-                        samples_path=samples_path,
-                        task_description=task_description,
-                        data_path=data_path,
-                        pass_count=pass_count,
-                        total_samples=total,
-                        repair_attempt=rollout_attempt + 1,
-                        max_attempts=max_rollout_repair_retries,
+            elif phase == Phase.ANALYSIS:
+                if iteration < max_iterations:
+                    result = _run_phase_analysis(
+                        state, iter_state, opencode_model, opencode_url,
+                        stale_timeout=stale_timeout,
+                        http_timeout=http_timeout,
                     )
-                    if not repair_ok:
-                        print(f"  Rollout repair failed, continuing with zero score")
-                        break
-                    print(f"  Rollout repair completed, re-running rollout...")
+                    iter_state.phase_results["analysis"] = result.to_dict()
+                    save_checkpoint(state)
 
-        # Phase Evaluation（FSM evaluate → samples fallback）
-        if exit_code == 0:
-            eval_score: float | None = None
-            eval_source = ""
+            elif phase == Phase.COMPLETE:
+                iter_state.current_phase = Phase.COMPLETE.value
+                save_checkpoint(state)
 
-            # FSM evaluate
-            if session and trained_model:
-                fsm_eval = _try_fsm_evaluate(
-                    workspace, trained_model, fsm_config, session,
-                    data_path=data_path, output_dir=output_dir,
-                )
-                if fsm_eval and fsm_eval.get("ok"):
-                    eval_score = _normalize_score(fsm_eval.get("score"))
-                    eval_source = "FSM evaluate"
-
-            # Fallback：复用 rollout 阶段已计算的 samples score
-            if eval_score is None and result.samples_path:
-                if not cached_samples_score:
-                    cached_samples_score = _compute_score_from_samples(result.samples_path)
-                if cached_samples_score and cached_samples_score.get("ok"):
-                    eval_score = _normalize_score(cached_samples_score["score"])
-                    eval_source = f"samples ({cached_samples_score['pass_count']}/{cached_samples_score['total']})"
-
-            print(f"\n{'='*60}")
-            print(f"  Phase Evaluation")
-            print(f"{'='*60}")
-            if eval_score is not None:
-                print(f"  Score: {eval_score}")
-                print(f"  Source: {eval_source}")
-                result.score = eval_score
-                result.model_path = trained_model
-                if best_score is None or eval_score > best_score:
-                    best_score = eval_score
-                    best_iteration = iteration
-            else:
-                print(f"  No score available (FSM and samples both failed)")
-
-        # Phase Analysis: 让 OpenCode 自分析（非最后一轮时执行）
-        if iteration < max_iterations:
-            try:
-                analysis = phase_analysis(
-                    iteration, workspace, result.code_path,
-                    training_log_path, result.score,
-                    samples_path=result.samples_path,
-                    opencode_model=opencode_model,
-                    opencode_url=opencode_url,
-                    max_agent_steps=max_agent_steps,
-                )
-                result.analysis = analysis
-            except Exception as e:
-                print(f"  Analysis phase failed (non-fatal): {e}")
-
-        history.append(result)
+        # ---- 迭代结束 ----
+        # 追加到 history
+        history.append(IterationResult(
+            iteration=iter_state.iteration,
+            exit_code=iter_state.exit_code,
+            training_time=iter_state.training_time,
+            score=iter_state.score,
+            agent_score=iter_state.agent_score,
+            model_path=iter_state.model_path,
+            code_path=iter_state.code_path,
+            samples_path=iter_state.samples_path,
+            analysis=iter_state.analysis,
+        ))
 
         iter_elapsed = time.time() - iter_start
-        print(f"\n  --- Iteration {iteration} Summary ---")
-        print(f"  Exit code: {result.exit_code}")
-        print(f"  Score: {result.score}")
-        print(f"  Best so far: {best_score} (iter {best_iteration})")
-        print(f"  Iteration time: {iter_elapsed:.0f}s")
+        print_iteration_summary(
+            iteration=iteration,
+            score=iter_state.score,
+            agent_score=iter_state.agent_score,
+            best_score=best_score,
+            best_iteration=best_iteration,
+            elapsed=iter_elapsed,
+        )
 
+    # ----- Pipeline 完成 -----
     total_time = time.time() - pipeline_start
-    print(f"\n{'#'*60}")
-    print(f"  Pipeline Complete")
-    print(f"  Best score: {best_score}")
-    print(f"  Best iteration: {best_iteration}")
-    print(f"  Total iterations: {len(history)}")
-    print(f"  Total time: {total_time:.0f}s")
-    print(f"{'#'*60}")
+    print_pipeline_footer(best_score, best_iteration,
+                          len(state.iterations), total_time)
 
     summary = {
         "task": task,
@@ -852,17 +901,20 @@ def run_pipeline(
         "best_score": best_score,
         "best_iteration": best_iteration,
         "total_time": total_time,
+        "verifier_sha256": state.verifier_sha256 or None,
         "iterations": [
             {
-                "iteration": r.iteration,
-                "exit_code": r.exit_code,
-                "training_time": r.training_time,
-                "score": r.score,
-                "samples_path": r.samples_path,
+                "iteration": it.iteration,
+                "exit_code": it.exit_code,
+                "training_time": it.training_time,
+                "score": it.score,
+                "agent_score": it.agent_score,
+                "samples_path": it.samples_path,
+                "verification": it.verification,
             }
-            for r in history
+            for it in state.iterations
         ],
     }
     summary_path = Path(workspace) / "pipeline_results.json"
     summary_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False))
-    print(f"  Results saved: {summary_path}")
+    console.print(f"  [dim]Results saved:[/] {summary_path}")

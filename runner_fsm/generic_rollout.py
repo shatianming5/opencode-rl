@@ -21,6 +21,7 @@ if __package__ in (None, ""):
 import json
 import random
 import re
+import textwrap
 import time
 import urllib.error
 import urllib.request
@@ -36,7 +37,13 @@ if __package__ in (None, ""):
         _read_json_object,
     )
 else:
-    from ._util import _ensure_openai_v1_base, _find_hf_test_parquet, _parse_json_str_list, _read_json_object
+    from ._util import (
+        _ensure_openai_v1_base,
+        _find_hf_test_parquet,
+        _parse_json_str_list,
+        _read_json_object,
+    )
+
 
 def _chat_completion(
     *,
@@ -83,9 +90,28 @@ def _chat_completion(
     content = msg.get("content")
     return content if isinstance(content, str) else ""
 
+
 _RE_NUM = re.compile(r"-?\\d+(?:,\\d{3})*(?:\\.\\d+)?(?:/\\d+(?:\\.\\d+)?)?")
 
 _RE_FINAL_LINE = re.compile(r"(?im)^\\s*final\\s*[:：]\\s*(?P<ans>.+?)\\s*$")
+
+
+def _can_use_remote_completion(base_url: str | None, api_key: str | None) -> bool:
+    if not base_url:
+        return False
+    if api_key:
+        return True
+    lowered = base_url.strip().lower()
+    trusted_prefixes = (
+        "http://127.",
+        "https://127.",
+        "http://localhost",
+        "https://localhost",
+        "http+unix://",
+        "unix://",
+    )
+    return lowered.startswith(trusted_prefixes)
+
 
 def _maybe_rollout_hf_qa_parquet(
     repo_root: Path,
@@ -123,7 +149,11 @@ def _maybe_rollout_hf_qa_parquet(
         return False, {"reason": f"failed_to_read_parquet: {e}"}
 
     try:
-        if int(limit) > 0 and getattr(table, "num_rows", 0) and int(table.num_rows) > int(limit):
+        if (
+            int(limit) > 0
+            and getattr(table, "num_rows", 0)
+            and int(table.num_rows) > int(limit)
+        ):
             table = table.slice(0, int(limit))
     except Exception:
         pass
@@ -142,7 +172,9 @@ def _maybe_rollout_hf_qa_parquet(
         "{prompt}"
     )
 
-    samples_path = (artifacts_dir / f"rollout_samples_{int(time.time())}.jsonl").resolve()
+    samples_path = (
+        artifacts_dir / f"rollout_samples_{int(time.time())}.jsonl"
+    ).resolve()
     correct = 0
     lines = 0
     errors: list[str] = []
@@ -229,7 +261,13 @@ def _maybe_rollout_hf_qa_parquet(
             reward = 1.0 if is_ok else 0.0
             correct += int(is_ok)
             lines += 1
-            out.write(json.dumps({"prompt": prompt, "completion": completion, "reward": reward}, ensure_ascii=False) + "\n")
+            out.write(
+                json.dumps(
+                    {"prompt": prompt, "completion": completion, "reward": reward},
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
 
     if lines <= 0:
         return False, {"reason": "no_usable_rows_for_rollout"}
@@ -246,21 +284,96 @@ def _maybe_rollout_hf_qa_parquet(
         rollout["errors"] = errors[:3]
     return True, rollout
 
+
+def _read_text_excerpt(path: Path, *, limit: int = 1200) -> str:
+    try:
+        raw = path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return ""
+    snippet = raw.strip()
+    if not snippet:
+        return ""
+    snippet = re.sub(r"\s+", " ", snippet)
+    if len(snippet) > int(limit):
+        snippet = snippet[: int(limit)].rstrip() + "..."
+    return snippet
+
+
+def _build_repo_summary(repo_root: Path) -> str:
+    snippets: list[str] = []
+    for rel in ("description.md", "README.md", "readme.md"):
+        p = (repo_root / rel).resolve()
+        if p.exists():
+            excerpt = _read_text_excerpt(p)
+            if excerpt:
+                snippets.append(f"{rel} excerpt: {excerpt}")
+    train_path = (repo_root / "data" / "train.jsonl").resolve()
+    if train_path.exists():
+        try:
+            with train_path.open("r", encoding="utf-8", errors="replace") as f:
+                first_line = ""
+                for line in f:
+                    candidate = line.strip()
+                    if candidate:
+                        first_line = candidate
+                        break
+        except Exception:
+            first_line = ""
+        if first_line:
+            try:
+                obj = json.loads(first_line)
+            except Exception:
+                obj = None
+            if isinstance(obj, dict):
+                question = str(obj.get("question") or "").strip()
+                task_id = str(obj.get("task_id") or "").strip()
+                if question:
+                    question_excerpt = textwrap.shorten(
+                        re.sub(r"\s+", " ", question), width=280, placeholder="..."
+                    )
+                    if task_id:
+                        snippets.append(f"First task ({task_id}): {question_excerpt}")
+                    else:
+                        snippets.append(f"First task prompt: {question_excerpt}")
+    if not snippets:
+        return "Repository context unavailable; inspect workspace files under data/ and output/."
+    return "\n".join(snippets)
+
+
+def _fallback_completion(prompt: str, repo_summary: str) -> str:
+    prompt_clean = re.sub(r"\s+", " ", str(prompt or "").strip())
+    summary = repo_summary.strip() or "Repository context unavailable."
+    return (
+        "Automated fallback response (no inference endpoint detected).\n"
+        f"Prompt summary: {prompt_clean[:400]}\n\n"
+        f"Repository context:\n{summary}\n\n"
+        "Getting started: review description.md for benchmark details, inspect data/train.jsonl for HumanEval tasks, "
+        "and run .opencode_fsm/stages/evaluation.sh to execute hinted evaluations or reward averaging."
+    )
+
+
 def main() -> int:
     repo_root = Path(os.environ.get("OPENCODE_FSM_REPO_ROOT") or ".").resolve()
-    artifacts_dir = Path(os.environ.get("OPENCODE_FSM_ARTIFACTS_DIR") or (repo_root / ".opencode_fsm" / "artifacts"))
+    artifacts_dir = Path(
+        os.environ.get("OPENCODE_FSM_ARTIFACTS_DIR")
+        or (repo_root / ".opencode_fsm" / "artifacts")
+    )
     if not artifacts_dir.is_absolute():
         artifacts_dir = (repo_root / artifacts_dir).resolve()
     artifacts_dir.mkdir(parents=True, exist_ok=True)
 
     mode = (os.environ.get("OPENCODE_EVAL_MODE") or "smoke").strip().lower() or "smoke"
     try:
-        limit = int(os.environ.get("OPENCODE_EVAL_LIMIT") or (64 if mode == "full" else 8))
+        limit = int(
+            os.environ.get("OPENCODE_EVAL_LIMIT") or (64 if mode == "full" else 8)
+        )
     except Exception:
         limit = 8
     limit = max(1, int(limit))
 
-    base_url = (os.environ.get("OPENAI_API_BASE") or os.environ.get("OPENAI_BASE_URL") or "").strip()
+    base_url = (
+        os.environ.get("OPENAI_API_BASE") or os.environ.get("OPENAI_BASE_URL") or ""
+    ).strip()
     if base_url:
         base_url = base_url.rstrip("/")
     else:
@@ -285,12 +398,15 @@ def main() -> int:
                         b2 = str(svc.get("base_url") or "").strip()
                         if b2:
                             base_url = b2.rstrip("/")
-    if not base_url:
-        base_url = "https://api.openai.com/v1"
     api_key = (os.environ.get("OPENAI_API_KEY") or "").strip() or None
-    model = (os.environ.get("OPENCODE_LLM_MODEL") or os.environ.get("OPENAI_MODEL") or "").strip()
+    if not base_url and api_key:
+        base_url = "https://api.openai.com/v1"
+    can_use_remote = _can_use_remote_completion(base_url, api_key)
+    if not can_use_remote:
+        base_url = ""
+    model = (os.environ.get("OPENCODE_LLM_MODEL") or "").strip()
     if not model:
-        raise SystemExit("missing_model: set OPENCODE_LLM_MODEL or OPENAI_MODEL")
+        raise SystemExit("missing_model: set OPENCODE_LLM_MODEL")
 
     # HF dataset snapshot support: if detected, generate QA samples with rewards.
     ok_ds, ds_rollout = _maybe_rollout_hf_qa_parquet(
@@ -305,11 +421,16 @@ def main() -> int:
     if ok_ds:
         rollout_path = (repo_root / ".opencode_fsm" / "rollout.json").resolve()
         rollout_path.parent.mkdir(parents=True, exist_ok=True)
-        rollout_path.write_text(json.dumps(ds_rollout, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        rollout_path.write_text(
+            json.dumps(ds_rollout, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
         return 0
 
     # Default: generic, bounded "repo understanding" prompts (cap for safety).
     prompt_limit = max(1, min(int(limit), 32))
+    if mode == "smoke":
+        prompt_limit = min(prompt_limit, 1)
     hints = _parse_json_str_list(os.environ.get("OPENCODE_FSM_HINTS_JSON"))
     prompts: list[str] = []
     for h in hints[: max(0, prompt_limit)]:
@@ -338,26 +459,44 @@ def main() -> int:
 
     if not prompts:
         repo_name = repo_root.name
-        prompts = [f"Describe the purpose of the repository `{repo_name}` and how to get started."]
+        prompts = [
+            f"Describe the purpose of the repository `{repo_name}` and how to get started."
+        ]
     prompts = prompts[:prompt_limit]
-    samples_path = (artifacts_dir / f"rollout_samples_{int(time.time())}.jsonl").resolve()
+    samples_path = (
+        artifacts_dir / f"rollout_samples_{int(time.time())}.jsonl"
+    ).resolve()
 
     samples_written = 0
     errors_count = 0
     with samples_path.open("w", encoding="utf-8") as f:
+        repo_summary = _build_repo_summary(repo_root)
         for prompt in prompts:
-            try:
-                completion = _chat_completion(
-                    base_url=base_url,
-                    api_key=api_key,
-                    model=model,
-                    prompt=prompt,
-                    timeout_seconds=30,
-                )
-            except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, ValueError, json.JSONDecodeError):
-                completion = ""
-                errors_count += 1
-            obj = {"prompt": prompt, "completion": completion, "reward": 0.0}
+            completion = ""
+            reward = 0.0
+            if can_use_remote:
+                try:
+                    completion = _chat_completion(
+                        base_url=base_url,
+                        api_key=api_key,
+                        model=model,
+                        prompt=prompt,
+                        timeout_seconds=30,
+                    )
+                    reward = 1.0 if str(completion).strip() else 0.0
+                except (
+                    urllib.error.HTTPError,
+                    urllib.error.URLError,
+                    TimeoutError,
+                    ValueError,
+                    json.JSONDecodeError,
+                ):
+                    completion = ""
+                    errors_count += 1
+            if not str(completion or "").strip():
+                completion = _fallback_completion(prompt, repo_summary)
+                reward = 0.0
+            obj = {"prompt": prompt, "completion": completion, "reward": reward}
             f.write(json.dumps(obj, ensure_ascii=False) + "\n")
             samples_written += 1
 
@@ -370,8 +509,11 @@ def main() -> int:
         "counts": {"samples": samples_written, "errors": int(errors_count)},
         "paths": {"samples_jsonl": str(samples_path)},
     }
-    rollout_path.write_text(json.dumps(rollout, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    rollout_path.write_text(
+        json.dumps(rollout, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
     return 0
+
 
 if __name__ == "__main__":
     raise SystemExit(main())
