@@ -863,6 +863,11 @@ class OpenCodeClient(AgentClient):
 
                 if transport_unavailable and recover_tries < recover_budget:
                     recover_tries += 1
+                    # 诊断：打印触发恢复的原因和 server 进程状态
+                    _proc = getattr(self, '_proc', None)
+                    _exit_code = _proc.poll() if _proc else "no_proc"
+                    print(f"    [diag] transport error: {e.detail}", flush=True)
+                    print(f"    [diag] server process exit_code={_exit_code}, recover_try={recover_tries}/{recover_budget}", flush=True)
                     try:
                         recover_fn = getattr(self, "_recover_local_server_session", None)
                         if callable(recover_fn):
@@ -999,6 +1004,9 @@ class OpenCodeClient(AgentClient):
         # HTTP 超时自动跟随 stale_timeout：让 stale monitor 做真正的超时控制，
         # HTTP 层只是兜底安全网，永远不应先于 stale monitor 触发。
         msg_timeout = max(self._timeout_seconds, self._stale_timeout + 120)
+        if not getattr(self, '_diag_timeout_printed', False):
+            print(f"    [diag] timeout config: http={self._timeout_seconds}s, stale={self._stale_timeout}s, msg_deadline={msg_timeout}s", flush=True)
+            self._diag_timeout_printed = True
         data = self._request_json(
             "POST",
             f"/session/{self._session_id}/message",
@@ -1085,6 +1093,8 @@ class OpenCodeClient(AgentClient):
                     r.close()
                 except Exception:
                     pass
+            if "/message" in path:
+                print(f"    [diag] HTTP polling deadline reached: timeout={timeout}s, url={path}", flush=True)
             raise OpenCodeRequestError(
                 method=method, url=url, status=None,
                 detail=f"timeout: request exceeded {timeout}s",
@@ -1092,6 +1102,8 @@ class OpenCodeClient(AgentClient):
 
         if error_container:
             e = error_container[0]
+            if "/message" in path:
+                print(f"    [diag] HTTP thread error on message POST: {type(e).__name__}: {e}", flush=True)
             if isinstance(e, HTTPError):
                 detail = ""
                 try:

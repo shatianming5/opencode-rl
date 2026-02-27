@@ -227,6 +227,14 @@ LoRA 加载模式：
 - 你只负责写代码，不要自己执行训练脚本。pipeline 会用 accelerate 自动运行
 - 不要修改 {workspace}/code/verifier.py（如果存在），那是管线锁定的验证器
 - 完成后调用 finish 工具结束
+
+## 重要：文件读取限制
+- **禁止用 read 工具读取超过 500 行的文件**，这会导致系统卡死
+- 查看大型库文件（如 trl 源码、transformers 源码）时，只用 bash 命令：
+  - `python3 -c "import inspect; from trl import GRPOTrainer; print(inspect.signature(GRPOTrainer.__init__))"` 查看函数签名
+  - `grep -n 'def method_name' /path/to/file.py` 定位函数位置
+  - `sed -n '100,150p' /path/to/file.py` 读取指定行范围
+- **绝对不要** read 整个 `grpo_trainer.py`、`modeling_*.py` 等库源码文件
 {history_section}"""
 
 
@@ -252,6 +260,10 @@ def build_fix_prompt(
 5. 修改 {code_path}
 6. 不要运行完整训练——pipeline 会执行
 7. 完成后调用 finish 工具结束
+
+## 重要：文件读取限制
+- **禁止用 read 工具读取超过 500 行的文件**，会导致系统卡死
+- 查看库源码时用 `grep -n`、`sed -n 'N,Mp'`、`python3 -c "import inspect; ..."` 等方式只看关键片段
 """
 
 
@@ -296,6 +308,10 @@ def build_analysis_prompt(
 - 下一轮的具体改进建议（最多3条，按优先级排序）
 
 用日志和评测样本中的具体数据支撑你的分析（引用评测通过率、loss 趋势、具体样本等）。
+
+## 重要：文件读取限制
+- **禁止用 read 工具读取超过 500 行的文件**，会导致系统卡死
+- 查看大文件用 `head`、`tail`、`grep -n`、`sed -n 'N,Mp'` 只看关键片段
 
 完成后调用 finish 工具结束。
 """
@@ -397,5 +413,6 @@ cat {code_path}
 ## 约束
 - 只修改 `{code_path}`，不要改变训练逻辑，只修复 --eval-only 模式
 - 不要修改 verifier.py（如果存在），那是管线锁定的验证器
+- **禁止用 read 工具读取超过 500 行的文件**（会导致系统卡死），用 grep/sed/head 查看关键片段
 - 完成后调用 finish 工具
 """
