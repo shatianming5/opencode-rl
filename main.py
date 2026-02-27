@@ -57,6 +57,15 @@ def main():
         sys.exit(0)
 
     bench = get_benchmark(args.benchmark)
+
+    # 数据不存在时自动下载
+    if not bench.train_jsonl.exists():
+        print(f"  数据文件不存在，自动下载 {args.benchmark} ...")
+        from benchmarks.download import download_benchmark
+        if not download_benchmark(bench.root):
+            print(f"  ERROR: 数据下载失败，请手动运行: python benchmarks/download.py {args.benchmark}")
+            sys.exit(1)
+
     data_dir = str(bench.data_dir.resolve())
 
     model_path = os.environ.get("MODEL_PATH") or resolve_model_path(args.base_model)

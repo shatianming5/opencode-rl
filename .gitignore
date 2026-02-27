@@ -22,3 +22,6 @@ runs/
 
 # Auto-generated OpenCode config (created by run scripts)
 .opencode-config/
+
+# Benchmark 数据（自动下载，不入库）
+benchmarks/*/data/
