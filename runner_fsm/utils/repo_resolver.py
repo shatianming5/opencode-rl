@@ -17,7 +17,9 @@ from urllib.request import Request, urlopen
 _OWNER_REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 _GITHUB_ARCHIVE_HOSTS = {"github.com", "www.github.com"}
 _HF_HOSTS = {"huggingface.co", "www.huggingface.co"}
-_PREFERRED_CLONES_BASE = Path("/data/tiansha/opencode_fsm_targets")
+_PREFERRED_CLONES_BASE = Path(
+    os.environ.get("OPENCODE_FSM_CLONES_DIR") or "/data/tiansha/opencode_fsm_targets"
+)
 
 def is_probably_repo_url(repo: str) -> bool:
     s = str(repo or "").strip()

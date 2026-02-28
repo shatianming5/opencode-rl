@@ -21,6 +21,23 @@ from .stream import make_stream_printer
 from .types import IterationResult, PhaseResult
 from .ui import console, print_phase_header, print_phase_status
 
+# Maximum lines to collect from subprocess output to prevent OOM
+_MAX_COLLECTED_LINES = 50000
+# Maximum stdout string size in bytes (20MB: 2MB head + 18MB tail)
+_MAX_STDOUT_BYTES = 20 * 1024 * 1024
+_STDOUT_HEAD_BYTES = 2 * 1024 * 1024
+
+
+def _cap_stdout(collected: list[str]) -> str:
+    """Join collected lines and cap total size, preserving head and tail."""
+    raw = "\n".join(collected)
+    if len(raw) <= _MAX_STDOUT_BYTES:
+        return raw
+    head = raw[:_STDOUT_HEAD_BYTES]
+    tail_bytes = _MAX_STDOUT_BYTES - _STDOUT_HEAD_BYTES - 100  # margin for marker
+    tail_part = raw[-tail_bytes:]
+    return head + "\n...[TRUNCATED]...\n" + tail_part
+
 
 def phase_verifier_generation(
     workspace: str,
@@ -224,28 +241,38 @@ def phase_training(
             bufsize=1,
             env={**os.environ, "PYTHONUNBUFFERED": "1"},
         )
-        deadline = time.time() + timeout
-        while True:
-            remaining = deadline - time.time()
-            if remaining <= 0:
-                proc.kill()
-                proc.wait()
-                collected.append(f"\n  TIMEOUT after {timeout}s")
-                console.print(f"  [bold red]TIMEOUT after {timeout}s[/]")
-                break
-            line = proc.stdout.readline()
-            if not line and proc.poll() is not None:
-                break
-            if line:
-                line = line.rstrip("\n")
-                collected.append(line)
-                console.print(f"  [dim]\\[train][/] {line}")
+        try:
+            deadline = time.time() + timeout
+            while True:
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    proc.kill()
+                    proc.wait()
+                    collected.append(f"\n  TIMEOUT after {timeout}s")
+                    console.print(f"  [bold red]TIMEOUT after {timeout}s[/]")
+                    break
+                line = proc.stdout.readline()
+                if not line and proc.poll() is not None:
+                    break
+                if line:
+                    line = line.rstrip("\n")
+                    if len(collected) < _MAX_COLLECTED_LINES:
+                        collected.append(line)
+                    elif len(collected) == _MAX_COLLECTED_LINES:
+                        collected.append(f"...[TRUNCATED at {_MAX_COLLECTED_LINES} lines]...")
+                    console.print(f"  [dim]\\[train][/] {line}")
+        finally:
+            try:
+                proc.stdout.close()
+            except Exception:
+                pass
+            proc.wait()
         exit_code = proc.returncode if proc.returncode is not None else -1
     except Exception as e:
         collected.append(f"Exception: {e}")
         console.print(f"  [bold red]Exception:[/] {e}")
 
-    stdout = "\n".join(collected)
+    stdout = _cap_stdout(collected)
     elapsed = time.time() - start
     ec_style = "green" if exit_code == 0 else "red"
     console.print(f"  [dim]Exit code:[/] [{ec_style}]{exit_code}[/]  [dim]Time:[/] {elapsed:.1f}s")
@@ -301,28 +328,38 @@ def phase_eval_generate(
             bufsize=1,
             env={**os.environ, "PYTHONUNBUFFERED": "1"},
         )
-        deadline = time.time() + timeout
-        while True:
-            remaining = deadline - time.time()
-            if remaining <= 0:
-                proc.kill()
-                proc.wait()
-                collected.append(f"\n  TIMEOUT after {timeout}s")
-                console.print(f"  [bold red]TIMEOUT after {timeout}s[/]")
-                break
-            line = proc.stdout.readline()
-            if not line and proc.poll() is not None:
-                break
-            if line:
-                line = line.rstrip("\n")
-                collected.append(line)
-                console.print(f"  [dim]\\[eval][/] {line}")
+        try:
+            deadline = time.time() + timeout
+            while True:
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    proc.kill()
+                    proc.wait()
+                    collected.append(f"\n  TIMEOUT after {timeout}s")
+                    console.print(f"  [bold red]TIMEOUT after {timeout}s[/]")
+                    break
+                line = proc.stdout.readline()
+                if not line and proc.poll() is not None:
+                    break
+                if line:
+                    line = line.rstrip("\n")
+                    if len(collected) < _MAX_COLLECTED_LINES:
+                        collected.append(line)
+                    elif len(collected) == _MAX_COLLECTED_LINES:
+                        collected.append(f"...[TRUNCATED at {_MAX_COLLECTED_LINES} lines]...")
+                    console.print(f"  [dim]\\[eval][/] {line}")
+        finally:
+            try:
+                proc.stdout.close()
+            except Exception:
+                pass
+            proc.wait()
         exit_code = proc.returncode if proc.returncode is not None else -1
     except Exception as e:
         collected.append(f"Exception: {e}")
         console.print(f"  [bold red]Exception:[/] {e}")
 
-    stdout = "\n".join(collected)
+    stdout = _cap_stdout(collected)
     elapsed = time.time() - start
     ec_style = "green" if exit_code == 0 else "red"
     console.print(f"  [dim]Exit code:[/] [{ec_style}]{exit_code}[/]  [dim]Time:[/] {elapsed:.1f}s")

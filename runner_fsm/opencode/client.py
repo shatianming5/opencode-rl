@@ -23,6 +23,18 @@ from .tool_parser import parse_tool_calls, format_tool_results
 from .tool_executor import ToolPolicy, execute_tool_calls
 from ..utils.subprocess import tail
 
+# Module-level tracking of all active OpenCodeClient instances for cleanup on signal
+_active_clients: set = set()
+
+
+def _find_free_port(host: str = "127.0.0.1") -> int:
+    """Find a free port with SO_REUSEADDR to reduce TOCTOU race window."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind((host, 0))
+        _, port = s.getsockname()
+    return port
+
 def select_bash_mode(*, purpose: str, default_bash_mode: str, scaffold_bash_mode: str) -> str:
     p = str(purpose or "").strip().lower()
     default = str(default_bash_mode or "restricted").strip().lower() or "restricted"
@@ -148,6 +160,7 @@ class OpenCodeClient(AgentClient):
         self._temp_config_home: Path | None = None
         self._server_log_file = None
         self._owns_local_server = not bool(base_url)
+        _active_clients.add(self)
 
         if base_url:
             base_url_s = str(base_url).strip()
@@ -207,6 +220,7 @@ class OpenCodeClient(AgentClient):
             raise
 
     def close(self) -> None:
+        _active_clients.discard(self)
         self._stop_local_server()
         if self._server_log_file is not None:
             try:
@@ -217,33 +231,34 @@ class OpenCodeClient(AgentClient):
 
     def _stop_local_server(self) -> None:
         if self._proc is not None:
-            try:
-                # Do not block shutdown on a potentially wedged server.
-                self._request_json("POST", "/instance/dispose", body=None, require_auth=True, timeout_seconds=5)
-            except Exception:
-                pass
-            try:
-                if os.name == "posix":
-                    try:
-                        os.killpg(os.getpgid(self._proc.pid), signal.SIGTERM)
-                    except Exception:
-                        self._proc.terminate()
-                else:  # pragma: no cover
-                    self._proc.terminate()
+            already_dead = self._proc.poll() is not None
+            if not already_dead:
                 try:
-                    self._proc.wait(timeout=5)
+                    # Do not block shutdown on a potentially wedged server.
+                    self._request_json("POST", "/instance/dispose", body=None, require_auth=True, timeout_seconds=5)
                 except Exception:
+                    pass
+                try:
                     if os.name == "posix":
                         try:
-                            os.killpg(os.getpgid(self._proc.pid), signal.SIGKILL)
+                            os.killpg(os.getpgid(self._proc.pid), signal.SIGTERM)
                         except Exception:
-                            self._proc.kill()
+                            self._proc.terminate()
                     else:  # pragma: no cover
-                        self._proc.kill()
-            except Exception:
-                pass
-            finally:
-                self._proc = None
+                        self._proc.terminate()
+                    try:
+                        self._proc.wait(timeout=5)
+                    except Exception:
+                        if os.name == "posix":
+                            try:
+                                os.killpg(os.getpgid(self._proc.pid), signal.SIGKILL)
+                            except Exception:
+                                self._proc.kill()
+                        else:  # pragma: no cover
+                            self._proc.kill()
+                except Exception:
+                    pass
+            self._proc = None
         if self._server_log_file is not None:
             try:
                 self._server_log_file.close()
@@ -333,7 +348,9 @@ class OpenCodeClient(AgentClient):
         def stop(self):
             self._stop.set()
             if self._thread:
-                self._thread.join(timeout=1)
+                self._thread.join(timeout=2)
+                if self._thread.is_alive():
+                    print("    [diag] WARNING: LLM monitor thread did not exit within 2s", flush=True)
             # Flush any remaining buffer
             if self._line_buf.strip():
                 text = self._line_buf.strip()
@@ -431,7 +448,7 @@ class OpenCodeClient(AgentClient):
                         self._timed_out.set()
                         # Signal client to NOT recover — propagate the error
                         if self._client_ref is not None:
-                            self._client_ref._stale_timeout_flag = True
+                            self._client_ref._stale_timeout_event.set()
                         # 杀掉 server 进程以中断阻塞的 HTTP 请求
                         if self._server_proc:
                             try:
@@ -526,7 +543,7 @@ class OpenCodeClient(AgentClient):
 
         prompt = text
         trace: list[dict[str, Any]] = []
-        self._stale_timeout_flag = False  # reset per run
+        self._stale_timeout_event = threading.Event()  # reset per run
         for turn_idx in range(self._max_turns):
             monitor = None
             if on_turn:
@@ -670,9 +687,7 @@ class OpenCodeClient(AgentClient):
             raise RuntimeError("`opencode` not found in PATH. Install it from https://opencode.ai/")
 
         host = "127.0.0.1"
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.bind((host, 0))
-            _host, port = s.getsockname()
+        port = _find_free_port(host)
 
         user = (username or "opencode").strip() or "opencode"
         pwd = secrets.token_urlsafe(24)
@@ -734,6 +749,7 @@ class OpenCodeClient(AgentClient):
         """
         proxy_script = Path(__file__).with_name("llm_proxy.py")
         if not proxy_script.exists():
+            print("    [diag] WARNING: llm_proxy.py not found, token logging and stale timeout visualization disabled", flush=True)
             return
 
         # ---- 1. Find the real upstream URL ----
@@ -764,12 +780,11 @@ class OpenCodeClient(AgentClient):
                 upstream_url = upstream_url[:-3]
 
         if not upstream_url:
-            return  # No URL to proxy
+            print("    [diag] WARNING: no upstream URL found for LLM proxy, token logging disabled", flush=True)
+            return
 
         # ---- 2. Start proxy process ----
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.bind(("127.0.0.1", 0))
-            _, proxy_port = s.getsockname()
+        proxy_port = _find_free_port("127.0.0.1")
 
         log_dir.mkdir(parents=True, exist_ok=True)
         self._token_log_path = log_dir / "llm_tokens.log"
@@ -778,12 +793,14 @@ class OpenCodeClient(AgentClient):
         proxy_log = log_dir / "llm_proxy.log"
         self._proxy_log_file = proxy_log.open("w", encoding="utf-8")
 
+        proxy_timeout = int(self._stale_timeout + 300)
         self._proxy_proc = subprocess.Popen(
             [
                 sys.executable, str(proxy_script),
                 "--port", str(proxy_port),
                 "--upstream", upstream_url,
                 "--log", str(self._token_log_path),
+                "--timeout", str(proxy_timeout),
             ],
             stdin=subprocess.DEVNULL,
             stdout=self._proxy_log_file,
@@ -812,8 +829,25 @@ class OpenCodeClient(AgentClient):
         # b) Also set OPENAI_BASE_URL for providers that read it from env.
         env["OPENAI_BASE_URL"] = f"{proxy_base}/v1"
 
-        # Wait briefly for proxy to start
-        time.sleep(0.3)
+        # Wait for proxy to be ready (poll port instead of blind sleep)
+        _proxy_ready = False
+        for _pw in range(50):  # up to 10s (50 * 0.2s)
+            try:
+                with socket.create_connection(("127.0.0.1", proxy_port), timeout=0.5):
+                    _proxy_ready = True
+                    break
+            except OSError:
+                time.sleep(0.2)
+        if not _proxy_ready:
+            print(f"    [diag] WARNING: LLM proxy on port {proxy_port} not ready after 10s, continuing without proxy", flush=True)
+            # Kill the proxy process since it's not working
+            try:
+                self._proxy_proc.kill()
+            except Exception:
+                pass
+            self._proxy_proc = None
+            self._token_log_path = None
+            return
 
     def _post_message_with_retry(self, *, model: Any, text: str) -> Any:
         attempts = 1 + int(self._request_retry_attempts or 0)
@@ -856,7 +890,7 @@ class OpenCodeClient(AgentClient):
                         transport_unavailable = any(n in d for n in needles)
 
                 # If stale timeout killed the server, don't recover — let it propagate
-                if getattr(self, '_stale_timeout_flag', False):
+                if getattr(self, '_stale_timeout_event', None) and self._stale_timeout_event.is_set():
                     raise StaleThinkingTimeout(
                         f"LLM stale thinking timeout — server killed by monitor"
                     ) from e
@@ -1073,7 +1107,7 @@ class OpenCodeClient(AgentClient):
             if not req_thread.is_alive():
                 break
             # Check if stale timeout was triggered — abort immediately
-            if getattr(self, '_stale_timeout_flag', False):
+            if getattr(self, '_stale_timeout_event', None) and self._stale_timeout_event.is_set():
                 # 强制关闭底层连接，让后台线程的 read() 立即失败退出
                 for r in resp_ref:
                     try:

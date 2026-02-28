@@ -20,8 +20,10 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import threading
 import time
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from socketserver import ThreadingMixIn
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError
 
@@ -29,15 +31,39 @@ from urllib.error import HTTPError
 _upstream: str = ""
 _log_path: str = ""
 _debug: bool = False
+_upstream_timeout: int = 600
+
+# Persistent log file handle + lock (Fix 10: avoid open/close per write)
+_log_lock = threading.Lock()
+_log_file = None  # type: ignore
+
+
+def _open_log():
+    """Open the persistent log file handle. Called once from main()."""
+    global _log_file
+    if _log_path:
+        _log_file = open(_log_path, "a", encoding="utf-8")
+
+
+def _close_log():
+    """Close the persistent log file handle."""
+    global _log_file
+    if _log_file is not None:
+        try:
+            _log_file.close()
+        except Exception:
+            pass
+        _log_file = None
 
 
 def _write_log(msg: str):
-    try:
-        with open(_log_path, "a", encoding="utf-8") as f:
-            f.write(msg)
-            f.flush()
-    except Exception:
-        pass
+    with _log_lock:
+        try:
+            if _log_file is not None:
+                _log_file.write(msg)
+                _log_file.flush()
+        except Exception:
+            pass
 
 
 def _extract_token(chunk: dict) -> str:
@@ -345,7 +371,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
         req = Request(url, data=body, headers=headers, method="POST")
 
         try:
-            resp = urlopen(req, timeout=300)
+            resp = urlopen(req, timeout=_upstream_timeout)
         except HTTPError as e:
             self.send_response(e.code)
             for k, v in e.headers.items():
@@ -450,22 +476,33 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self.wfile.write(f"proxy error: {e}".encode())
 
 
+class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
+    daemon_threads = True
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, required=True)
     parser.add_argument("--upstream", type=str, required=True)
     parser.add_argument("--log", type=str, required=True)
     parser.add_argument("--debug", action="store_true", help="Log raw SSE data for debugging")
+    parser.add_argument("--timeout", type=int, default=600,
+                        help="Upstream request timeout in seconds (default: 600)")
     args = parser.parse_args()
 
-    global _upstream, _log_path, _debug
+    global _upstream, _log_path, _debug, _upstream_timeout
     _upstream = args.upstream.rstrip("/")
     _log_path = args.log
     _debug = args.debug
+    _upstream_timeout = max(30, args.timeout)
 
-    server = HTTPServer(("127.0.0.1", args.port), ProxyHandler)
-    print(f"LLM proxy listening on 127.0.0.1:{args.port} -> {_upstream}", flush=True)
-    server.serve_forever()
+    _open_log()
+    try:
+        server = ThreadingHTTPServer(("127.0.0.1", args.port), ProxyHandler)
+        print(f"LLM proxy listening on 127.0.0.1:{args.port} -> {_upstream} (timeout={_upstream_timeout}s)", flush=True)
+        server.serve_forever()
+    finally:
+        _close_log()
 
 
 if __name__ == "__main__":

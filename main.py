@@ -6,7 +6,9 @@ OpenCode RL Post-training Pipeline (Fixed-Stage)
 """
 
 import argparse
+import atexit
 import os
+import signal
 import shutil
 import sys
 import time
@@ -17,7 +19,32 @@ from pipeline.runner import run_pipeline
 from pipeline.utils import resolve_model_path
 
 
+def _cleanup_active_clients():
+    """Close all active OpenCodeClient instances to prevent orphan processes."""
+    try:
+        from runner_fsm.opencode.client import _active_clients
+    except ImportError:
+        return
+    for client in list(_active_clients):
+        try:
+            client.close()
+        except Exception:
+            pass
+
+
+def _signal_handler(signum, frame):
+    """Handle SIGINT/SIGTERM: clean up child processes and exit."""
+    sig_name = signal.Signals(signum).name if hasattr(signal, 'Signals') else str(signum)
+    print(f"\n  Received {sig_name}, cleaning up...", flush=True)
+    _cleanup_active_clients()
+    sys.exit(128 + signum)
+
+
 def main():
+    signal.signal(signal.SIGTERM, _signal_handler)
+    signal.signal(signal.SIGINT, _signal_handler)
+    atexit.register(_cleanup_active_clients)
+
     parser = argparse.ArgumentParser(description="OpenCode RL Pipeline (Fixed-Stage)")
     parser.add_argument("--benchmark", type=str, default="gsm8k",
                         help="Benchmark 名称（对应 benchmarks/ 下的子目录）")

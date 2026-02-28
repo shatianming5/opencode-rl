@@ -246,11 +246,13 @@ def _run_phase_verify_gen(
         # 验证 verifier.py 的正确性
         ok, err = validate_verifier(verifier_path, data_path)
         if ok:
-            # 锁定：计算 SHA256，备份内容
+            # 锁定：计算 SHA256，备份到独立文件
             sha256 = compute_sha256(verifier_path)
-            backup = Path(verifier_path).read_text(encoding="utf-8")
+            backup_path = Path(workspace) / "code" / "verifier_backup.py"
+            backup_content = Path(verifier_path).read_text(encoding="utf-8")
+            backup_path.write_text(backup_content, encoding="utf-8")
             state.verifier_sha256 = sha256
-            state.verifier_backup = backup
+            state.verifier_backup = str(backup_path)
 
             console.print(f"  [green]Verifier validated and locked[/] [dim](SHA256: {sha256[:16]}...)[/]")
             return PhaseResult(
@@ -325,7 +327,10 @@ def _run_phase_training(
 
     training_log_path = str(Path(workspace) / "code" / "training_stdout.log")
     stdout = train_result.payload.get("stdout", "")
-    Path(training_log_path).write_text(stdout, encoding="utf-8")
+    try:
+        Path(training_log_path).write_text(stdout, encoding="utf-8")
+    except OSError as e:
+        console.print(f"  [bold yellow]WARNING:[/] Failed to write training log: {e}")
 
     total_time = train_result.payload.get("elapsed", 0.0)
 
@@ -354,7 +359,10 @@ def _run_phase_training(
         extra_time = train_result.payload.get("elapsed", 0.0)
         total_time += extra_time
         stdout = train_result.payload.get("stdout", "")
-        Path(training_log_path).write_text(stdout, encoding="utf-8")
+        try:
+            Path(training_log_path).write_text(stdout, encoding="utf-8")
+        except OSError as e:
+            console.print(f"  [bold yellow]WARNING:[/] Failed to write training log: {e}")
 
     exit_code = train_result.payload.get("exit_code", -1)
     iter_state.exit_code = exit_code

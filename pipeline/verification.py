@@ -24,6 +24,24 @@ def compute_sha256(file_path: str) -> str:
     return h.hexdigest()
 
 
+def _resolve_backup_content(backup: str) -> str:
+    """Resolve verifier backup: if it's a file path, read it; otherwise return as-is.
+
+    Backward compatible: old checkpoints store inline content, new ones store file paths.
+    """
+    if not backup:
+        return ""
+    # If it looks like a file path and exists, read the content
+    backup_path = Path(backup)
+    if backup_path.suffix == ".py" and backup_path.exists():
+        try:
+            return backup_path.read_text(encoding="utf-8")
+        except OSError:
+            return ""
+    # Otherwise treat as inline content (backward compat)
+    return backup
+
+
 def check_verifier_integrity(
     verifier_path: str,
     expected_sha256: str,
@@ -31,15 +49,19 @@ def check_verifier_integrity(
 ) -> bool:
     """检查 verifier.py 是否被篡改。若被篡改则恢复备份。
 
+    Args:
+        backup_content: Either inline source code (old format) or a file path (new format).
+
     Returns:
         True 如果完整性检查通过（或成功恢复），False 如果恢复失败。
     """
+    resolved_backup = _resolve_backup_content(backup_content)
     path = Path(verifier_path)
     if not path.exists():
-        if backup_content:
+        if resolved_backup:
             print(f"  [verifier] WARNING: {verifier_path} missing, restoring from backup")
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(backup_content, encoding="utf-8")
+            path.write_text(resolved_backup, encoding="utf-8")
             return True
         return False
 
@@ -52,9 +74,9 @@ def check_verifier_integrity(
     print(f"    Expected SHA256: {expected_sha256}")
     print(f"    Actual SHA256:   {actual_sha256}")
 
-    if backup_content:
+    if resolved_backup:
         print(f"  [verifier] Restoring from backup...")
-        path.write_text(backup_content, encoding="utf-8")
+        path.write_text(resolved_backup, encoding="utf-8")
         restored_sha = compute_sha256(verifier_path)
         if restored_sha == expected_sha256:
             print(f"  [verifier] Restored successfully")

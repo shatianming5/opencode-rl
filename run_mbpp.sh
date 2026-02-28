@@ -4,8 +4,8 @@ source /data/userdata/v-tiansha/venvs/opencode-rl/bin/activate
 
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-1,2,3}"
 export PYTHONUNBUFFERED=1
-export OPENAI_API_KEY="sk-1234"
-export OPENAI_API_BASE="http://10.150.240.117:38888"
+export OPENAI_API_KEY="sk-cliproxy-local"
+export OPENAI_API_BASE="http://127.0.0.1:8317/v1"
 export OPENCODE_MODEL="gpt-5.2"
 
 # 自动生成项目专属 opencode config，保持与环境变量一致
