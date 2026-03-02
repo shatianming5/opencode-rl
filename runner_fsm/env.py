@@ -451,6 +451,7 @@ def _call_repair(session: "EnvSession", run_root: Path, attempt: int, failed_sta
         retry_backoff_seconds=float(session.opencode_retry_backoff_seconds or 0.0),
         context_length=(int(session.opencode_context_length) if session.opencode_context_length is not None else None),
         max_prompt_chars=(int(session.opencode_max_prompt_chars) if session.opencode_max_prompt_chars is not None else None),
+        auto_compact=session.opencode_auto_compact,
     )
 
 
@@ -476,6 +477,7 @@ class EnvSession:
     opencode_retry_backoff_seconds: float = 2.0
     opencode_context_length: int | None = None
     opencode_max_prompt_chars: int | None = None
+    opencode_auto_compact: bool | None = None
     audit: str = "on"
     use_cache: bool = True
     runtime_env_path: Path | None = None
@@ -714,6 +716,7 @@ def setup(
     scaffold_opencode_bash: str = "full",
     strict_opencode: bool = True,
     artifacts_dir: Path | None = None,
+    opencode_auto_compact: bool | None = None,
 ) -> EnvSession:
     """Open an environment handle for a target repo/url and ensure a runnable contract exists."""
     clones_dir = Path(str(clones_dir)).expanduser().resolve() if clones_dir is not None else None
@@ -746,6 +749,7 @@ def setup(
         artifacts_dir=artifacts_dir,
         seed_stage_skeleton=not bool(strict_opencode),
         write_fallback_pipeline_yml=not bool(strict_opencode),
+        opencode_auto_compact=opencode_auto_compact,
     )
     hints = suggest_contract_hints(env_handle.repo)
     return EnvSession(
@@ -763,6 +767,7 @@ def setup(
         opencode_retry_backoff_seconds=float(opencode_retry_backoff_seconds or 0.0),
         opencode_context_length=(int(opencode_context_length) if opencode_context_length is not None else None),
         opencode_max_prompt_chars=(int(opencode_max_prompt_chars) if opencode_max_prompt_chars is not None else None),
+        opencode_auto_compact=opencode_auto_compact,
         audit=str(audit or "on"),
         use_cache=bool(use_cache),
     )

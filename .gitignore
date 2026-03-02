@@ -1,27 +1,9 @@
-doc/
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
 .venv/
 *.egg-info/
-
-# Run artifacts (each run creates runs/{benchmark}_{timestamp}/)
+dist/
+build/
 runs/
-
-# FSM runtime outputs (not committed)
-.opencode_fsm/artifacts/
-.opencode_fsm/cache/
-.opencode_fsm/venv*/
-.opencode_fsm/runtime_env.json
-.opencode_fsm/rollout.json
-.opencode_fsm/metrics.json
-.opencode_fsm/samples.jsonl
-.opencode_fsm/hints_*.json
-.opencode_fsm/scaffold_logs/
-.opencode_fsm/actions.yml
-.opencode_fsm/deploy.pid
-
-# Auto-generated OpenCode config (created by run scripts)
-.opencode-config/
-
-# Benchmark 数据（自动下载，不入库）
-benchmarks/*/data/
+.env

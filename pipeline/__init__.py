@@ -2,10 +2,9 @@
 
 from .phases import (
     phase_code_generation,
-    phase_eval_generate,
+    phase_evaluation,
     phase_fix_training,
     phase_training,
-    phase_verifier_generation,
 )
 from .runner import run_pipeline
 from .types import (
@@ -14,8 +13,6 @@ from .types import (
     Phase,
     PhaseResult,
     PipelineState,
-    VerificationResult,
-    VerifiedSample,
 )
 
 __all__ = [
@@ -25,11 +22,8 @@ __all__ = [
     "Phase",
     "PhaseResult",
     "PipelineState",
-    "VerificationResult",
-    "VerifiedSample",
     "phase_code_generation",
-    "phase_eval_generate",
+    "phase_evaluation",
     "phase_fix_training",
     "phase_training",
-    "phase_verifier_generation",
 ]

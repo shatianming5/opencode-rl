@@ -1,38 +1,9 @@
-"""Pipeline 工具函数：数据统计、GPU 信息、采样计数、模型解析。"""
+"""Pipeline 工具函数：数据统计、GPU 信息、模型解析。"""
 
 import json
 import os
 import subprocess
 from pathlib import Path
-
-
-def count_samples_jsonl(samples_path: str) -> tuple[int, int]:
-    """读取 samples.jsonl，返回 (total, pass_count)。
-
-    pass_count = reward >= 1.0 的样本数。
-    全项目统一使用此函数做采样计数，避免重复实现。
-    """
-    p = Path(samples_path)
-    if not p.exists():
-        return 0, 0
-    total = 0
-    passed = 0
-    try:
-        with open(p, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                total += 1
-                try:
-                    r = json.loads(line).get("reward", 0)
-                    if float(r) >= 1.0:
-                        passed += 1
-                except Exception:
-                    pass
-    except Exception:
-        pass
-    return total, passed
 
 
 def resolve_model_path(model_name: str) -> str:
@@ -137,55 +108,3 @@ def get_gpu_info() -> dict:
         num_gpus = nvidia_gpu_count
 
     return {"num_gpus": num_gpus, "gpu_name": gpu_name, "cuda_devices": cuda_devices}
-
-
-def get_rollout_samples_stats(samples_path: str) -> dict | None:
-    """读取 rollout 产生的 samples.jsonl，返回统计信息。"""
-    p = Path(samples_path)
-    if not p.exists():
-        return None
-
-    total = 0
-    eval_scores = []
-    prompt_lens = []
-    completion_lens = []
-    try:
-        with open(p, "r", encoding="utf-8") as f:
-            for line in f:
-                if not line.strip():
-                    continue
-                try:
-                    item = json.loads(line)
-                except Exception:
-                    continue
-                if not isinstance(item, dict):
-                    continue
-                total += 1
-                r = item.get("reward")
-                if isinstance(r, (int, float)):
-                    eval_scores.append(float(r))
-                pr = item.get("prompt", "")
-                co = item.get("completion", "")
-                if isinstance(pr, str):
-                    prompt_lens.append(len(pr))
-                if isinstance(co, str):
-                    completion_lens.append(len(co))
-    except Exception:
-        return None
-
-    if total == 0:
-        return None
-
-    avg_score = sum(eval_scores) / len(eval_scores) if eval_scores else 0.0
-    avg_prompt = sum(prompt_lens) // max(len(prompt_lens), 1)
-    avg_completion = sum(completion_lens) // max(len(completion_lens), 1)
-
-    return {
-        "total_samples": total,
-        "avg_eval_score": round(avg_score, 4),
-        "avg_prompt_len": avg_prompt,
-        "avg_completion_len": avg_completion,
-        "pass_rate": round(
-            sum(1 for r in eval_scores if r >= 1.0) / max(len(eval_scores), 1), 4
-        ),
-    }

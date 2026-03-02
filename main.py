@@ -2,7 +2,7 @@
 """
 OpenCode RL Post-training Pipeline (Fixed-Stage)
 
-每轮迭代：代码生成 → 训练执行 → --eval-only 评测 → 反馈注入。
+每轮迭代：代码生成 → 训练执行 → Grading Server 评测 → 反馈注入。
 """
 
 import argparse
@@ -54,18 +54,16 @@ def main():
     parser.add_argument("--max-iterations", type=int, default=5)
     parser.add_argument("--training-timeout", type=int, default=3600)
     parser.add_argument("--max-agent-steps", type=int, default=25)
-    parser.add_argument("--max-fix-retries", type=int, default=20,
-                        help="训练失败后最大修复重试次数")
-    parser.add_argument("--max-eval-repair-retries", type=int, default=2,
-                        help="--eval-only 全零 reward 时最大自动修复重试次数")
+    parser.add_argument("--max-retries", type=int, default=3,
+                        help="各阶段（code_gen/fix/analysis）失败后自动重试次数（默认 3）")
     parser.add_argument("--resume", action="store_true",
                         help="从上次 checkpoint 断点续跑（需指定 --run-dir）")
     parser.add_argument("--stale-timeout", type=int, default=180,
                         help="LLM 无响应超时秒数，超过后自动重试（默认 180）")
-    parser.add_argument("--max-verifier-retries", type=int, default=2,
-                        help="Verifier 生成内部最大重试次数（默认 2）")
     parser.add_argument("--http-timeout", type=int, default=300,
                         help="OpenCode HTTP 请求超时秒数（默认 300）")
+    parser.add_argument("--eval-timeout", type=int, default=600,
+                        help="Grading Server 评测请求超时秒数（默认 600）")
 
     parser.add_argument("--list-benchmarks", action="store_true",
                         help="列出所有可用 benchmark 并退出")
@@ -85,8 +83,8 @@ def main():
 
     bench = get_benchmark(args.benchmark)
 
-    # 数据不存在时自动下载
-    if not bench.train_jsonl.exists():
+    # 数据不存在时自动下载（如果框架已通过 DATA_PATH 提供数据则跳过）
+    if not os.environ.get("DATA_PATH") and not bench.train_jsonl.exists():
         print(f"  数据文件不存在，自动下载 {args.benchmark} ...")
         from benchmarks.download import download_benchmark
         if not download_benchmark(bench.root):
@@ -126,6 +124,14 @@ def main():
         if src_desc.exists() and not dst_desc.exists():
             shutil.copy2(src_desc, dst_desc)
 
+    # Benchmark 特有文件（如 eval.py, react_prompts.json）拷贝到 workspace
+    for fname in bench.expose_files:
+        src = bench.root / fname
+        dst = Path(run_dir) / fname
+        if src.exists() and not dst.exists():
+            shutil.copy2(src, dst)
+            print(f"  Exposed: {fname}")
+
     fsm_config = {
         "target_repo": run_dir,
         "opencode_url": os.environ.get("OPENCODE_URL", ""),
@@ -141,13 +147,14 @@ def main():
         max_iterations=args.max_iterations,
         training_timeout=args.training_timeout,
         max_agent_steps=args.max_agent_steps,
-        max_fix_retries=args.max_fix_retries,
-        max_eval_repair_retries=args.max_eval_repair_retries,
+        max_retries=args.max_retries,
         fsm_config=fsm_config,
         resume=args.resume,
         stale_timeout=args.stale_timeout,
-        max_verifier_retries=args.max_verifier_retries,
         http_timeout=args.http_timeout,
+        eval_timeout=args.eval_timeout,
+        task_type=bench.task_type,
+        expose_files=bench.expose_files,
     )
 
 

@@ -81,6 +81,7 @@ def repair_contract(
     retry_backoff_seconds: float = 2.0,
     context_length: int | None = None,
     max_prompt_chars: int | None = None,
+    auto_compact: bool | None = None,
 ) -> None:
     """Ask OpenCode to repair the repo-local contract under `.opencode_fsm/` (best-effort).
 
@@ -109,10 +110,12 @@ def repair_contract(
         bash_mode="restricted",
         scaffold_bash_mode="full",
         unattended=str(unattended or "strict"),
+        auto_compact=auto_compact,
         server_log_path=artifacts_dir / "opencode_server.log",
         session_title=f"{repo.name}:repair",
         username=oc_username,
         password=oc_password,
+        permission_overrides={"external_directory": {"*": "allow"}},
     )
     contract_before = snapshot_contract_files(repo)
     tool_trace: list[dict[str, object]] | None = None

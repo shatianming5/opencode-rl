@@ -1,0 +1,9 @@
+description: HumanEval code generation benchmark
+eval_mode: opencompass
+name: smith-humaneval
+opencompass_dataset: opencompass.configs.datasets.humaneval.humaneval_openai_sample_evals_gen_dcae0e
+source:
+  hf_dataset: openai/openai_humaneval
+  hf_split: test
+  max_samples: 0
+task_type: code

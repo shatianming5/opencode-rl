@@ -1,0 +1,9 @@
+description: 'Hendrycks MATH competition problems: solve a math word/problem and output
+  the final answer.'
+eval_mode: opencompass
+expose_files:
+- eval.py
+- download_data.py
+name: smith-math_hendrycks
+opencompass_dataset: opencompass.configs.datasets.math.math_gen_a58d9d
+task_type: math

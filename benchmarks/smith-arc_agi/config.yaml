@@ -1,0 +1,8 @@
+description: 'ARC-AGI-1 grid transformation tasks: infer the rule from examples and
+  output the correct grid.'
+eval_mode: per_sample
+expose_files:
+- eval.py
+- download_data.py
+name: smith-arc_agi
+task_type: reasoning

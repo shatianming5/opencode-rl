@@ -89,6 +89,8 @@ class OpenCodeClient(AgentClient):
         password: str | None = None,
         session_title: str | None = None,
         stale_timeout: float = 180.0,
+        auto_compact: bool | None = None,
+        permission_overrides: dict[str, Any] | None = None,
     ) -> None:
         self._repo = repo
         self._plan_rel = str(plan_rel or "PLAN.md").strip() or "PLAN.md"
@@ -138,6 +140,7 @@ class OpenCodeClient(AgentClient):
         self._unattended = str(unattended or "strict").strip().lower() or "strict"
         self._session_title = str(session_title or f"runner:{repo.name}")
         self._server_log_path = server_log_path.resolve() if server_log_path is not None else None
+        self._permission_overrides = permission_overrides or {}
 
         model_str = str(model or "").strip()
         if not model_str:
@@ -152,6 +155,7 @@ class OpenCodeClient(AgentClient):
         self._model_str: str = f"{provider_id}/{model_id}"
 
         self._stale_timeout = max(0.0, float(stale_timeout or 180.0))
+        self._auto_compact = auto_compact
 
         self._proc: subprocess.Popen[str] | None = None
         self._proxy_proc: subprocess.Popen[str] | None = None
@@ -197,6 +201,16 @@ class OpenCodeClient(AgentClient):
             else:
                 raise RuntimeError(f"OpenCode server failed health check: {tail(last_err, 2000)}")
 
+            if self._auto_compact is not None:
+                try:
+                    self._request_json(
+                        "PATCH", "/global/config",
+                        body={"compaction": {"auto": bool(self._auto_compact)}},
+                        require_auth=bool(self._server.password),
+                    )
+                except Exception:
+                    pass  # old server versions may not support this endpoint
+
             data = self._request_json(
                 "POST",
                 "/session",
@@ -228,6 +242,113 @@ class OpenCodeClient(AgentClient):
             except Exception:
                 pass
             self._server_log_file = None
+
+    @staticmethod
+    def _extract_context_info(msg: Any) -> dict[str, Any] | None:
+        """Extract token usage and compaction events from a message response.
+
+        Returns a dict with keys: input, output, reasoning, cache_read, cache_write,
+        total, cost, compaction (bool), summary (bool).
+        Returns None if the response doesn't contain token info (graceful degradation).
+        """
+        if not isinstance(msg, dict):
+            return None
+        info = msg.get("info")
+        if not isinstance(info, dict):
+            return None
+        tokens = info.get("tokens")
+        if not isinstance(tokens, dict):
+            return None
+
+        try:
+            # Support nested cache format: {cache: {read: N, write: N}} or flat {cacheRead: N}
+            cache_obj = tokens.get("cache")
+            if isinstance(cache_obj, dict):
+                cache_r = int(cache_obj.get("read") or 0)
+                cache_w = int(cache_obj.get("write") or 0)
+            else:
+                cache_r = int(tokens.get("cacheRead") or tokens.get("cache_read") or 0)
+                cache_w = int(tokens.get("cacheWrite") or tokens.get("cache_write") or 0)
+            result: dict[str, Any] = {
+                "input": int(tokens.get("input") or 0),
+                "output": int(tokens.get("output") or 0),
+                "reasoning": int(tokens.get("reasoning") or 0),
+                "cache_read": cache_r,
+                "cache_write": cache_w,
+                "total": int(tokens.get("total") or 0),
+                "cost": float(tokens.get("cost") or 0.0),
+            }
+        except (TypeError, ValueError):
+            return None
+
+        # If total wasn't provided, compute it
+        if result["total"] <= 0:
+            result["total"] = result["input"] + result["output"] + result["reasoning"]
+
+        # Check for compaction events in parts
+        compaction = False
+        summary = False
+        parts = msg.get("parts")
+        if isinstance(parts, list):
+            for part in parts:
+                if isinstance(part, dict):
+                    if part.get("type") == "compaction":
+                        compaction = True
+                    if part.get("type") == "summary":
+                        compaction = True
+                        summary = True
+        # Also check info.summary flag
+        if info.get("summary"):
+            summary = True
+
+        result["compaction"] = compaction
+        result["summary"] = summary
+        return result
+
+    def _print_context_status(self, turn: int, ctx_info: dict[str, Any], session_total: int) -> None:
+        """Print [context] and [compact] status lines after each turn."""
+        rc = self._LLMWaitMonitor._try_rich()
+        inp = ctx_info.get("input", 0)
+        out = ctx_info.get("output", 0)
+
+        # Format numbers with commas for readability
+        def _fmt(n: int) -> str:
+            return f"{n:,}"
+
+        # Build context line
+        ctx_len = self._context_length
+        if ctx_len and ctx_len > 0:
+            pct = (inp / ctx_len * 100) if ctx_len > 0 else 0
+            ctx_line = (
+                f"[context] turn {turn}: {_fmt(inp)}/{_fmt(ctx_len)} ({pct:.0f}%)"
+                f" | out={_fmt(out)} | session={_fmt(session_total)}"
+            )
+            style = "bold yellow" if pct > 70 else "dim"
+        else:
+            ctx_line = (
+                f"[context] turn {turn}: in={_fmt(inp)} out={_fmt(out)}"
+                f" | session total={_fmt(session_total)}"
+            )
+            style = "dim"
+
+        if rc:
+            # Escape [ ] so Rich doesn't eat them as markup tags
+            safe = ctx_line.replace("[", "\\[")
+            rc.print(f"    [{style}]{safe}[/]")
+        else:
+            print(f"    {ctx_line}", flush=True)
+
+        # Compaction events
+        if ctx_info.get("compaction"):
+            if rc:
+                rc.print(f"    [bold magenta]\\[compact] auto-compaction triggered[/]")
+            else:
+                print(f"    [compact] auto-compaction triggered", flush=True)
+        if ctx_info.get("summary"):
+            if rc:
+                rc.print(f"    [bold magenta]\\[compact] summary message (post-compaction)[/]")
+            else:
+                print(f"    [compact] summary message (post-compaction)", flush=True)
 
     def _stop_local_server(self) -> None:
         if self._proc is not None:
@@ -329,6 +450,11 @@ class OpenCodeClient(AgentClient):
             self._start = 0.0
             self._log_offset = 0
             self._line_buf = ""  # accumulate tokens into lines
+            # Running token count from proxy stream-end lines
+            self._proxy_output_tokens = 0
+            self._proxy_rounds = 0
+            # Streaming character count for real-time estimation (~4 chars/token)
+            self._proxy_stream_chars = 0
 
         def start(self):
             self._start = time.time()
@@ -368,19 +494,48 @@ class OpenCodeClient(AgentClient):
             except Exception:
                 return None
 
+        def _estimate_tokens(self) -> int:
+            """Best available token estimate: exact (from stream end) or char-based."""
+            exact = self._proxy_output_tokens
+            estimated = self._proxy_stream_chars // 4  # ~4 chars per token
+            return max(exact, estimated)
+
+        def _token_suffix(self) -> str:
+            """Build a token/round suffix string for display.
+
+            Three states:
+            - Tokens available: "| ~N tokens / R rounds"
+            - Stream in progress but no visible tokens (reasoning model): "| round R streaming"
+            - No stream activity: ""
+            """
+            est = self._estimate_tokens()
+            if est > 0:
+                suffix = f" | ~{est:,} tokens"
+                if self._proxy_rounds > 1:
+                    suffix += f" / {self._proxy_rounds} rounds"
+                return suffix
+            # Stream started but no content yet (reasoning model thinking)
+            if self._proxy_rounds > 0:
+                if self._proxy_rounds > 1:
+                    return f" | round {self._proxy_rounds} streaming"
+                return " | streaming"
+            return ""
+
         def _print_thinking(self, elapsed: float):
             rc = self._try_rich()
+            suffix = self._token_suffix()
             if rc:
-                rc.print(f"    [dim italic]... LLM thinking ({elapsed:.0f}s)[/]")
+                rc.print(f"    [dim italic]... LLM thinking ({elapsed:.0f}s){suffix}[/]")
             else:
-                print(f"    ... LLM thinking ({elapsed:.0f}s)", flush=True)
+                print(f"    ... LLM thinking ({elapsed:.0f}s){suffix}", flush=True)
 
         def _print_tool_call(self, tool_name: str, elapsed: float):
             rc = self._try_rich()
+            suffix = self._token_suffix()
             if rc:
-                rc.print(f"    [bold cyan]... agent calling: {tool_name}[/] [dim]({elapsed:.0f}s)[/]")
+                rc.print(f"    [bold cyan]... agent calling: {tool_name}[/] [dim]({elapsed:.0f}s){suffix}[/]")
             else:
-                print(f"    ... agent calling: {tool_name} ({elapsed:.0f}s)", flush=True)
+                print(f"    ... agent calling: {tool_name} ({elapsed:.0f}s){suffix}", flush=True)
 
         def _print_tool_detail(self, detail: str):
             if len(detail) > 200:
@@ -476,16 +631,38 @@ class OpenCodeClient(AgentClient):
                 return False
 
             printed = False
+            # Count raw streaming chars for real-time token estimation.
+            # Exclude control lines ([TOOL], [DBG], stream markers) — only
+            # actual LLM output text contributes to the estimate.
             for ch in new:
                 if ch == "\n":
                     line = self._line_buf.strip()
                     self._line_buf = ""
                     if not line:
                         continue
+                    # Parse proxy stream markers for running token count
+                    if "<<< stream" in line:
+                        # Format: [HH:MM:SS] <<< stream end 523 tokens 4.2s
+                        try:
+                            parts_s = line.split()
+                            for i, w in enumerate(parts_s):
+                                if w == "tokens" and i > 0:
+                                    self._proxy_output_tokens += int(parts_s[i - 1])
+                                    break
+                        except (ValueError, IndexError):
+                            pass
+                        printed = True  # count as activity
+                        continue
+                    if ">>> stream" in line:
+                        self._proxy_rounds += 1
+                        printed = True  # count as activity to delay stale timeout
+                        continue
+                    # Heartbeat from proxy (reasoning models produce no visible tokens)
+                    if line.startswith("[HEARTBEAT]"):
+                        printed = True  # keep stale timeout at bay
+                        continue
                     # 过滤噪音
                     if ("[DBG" in line
-                            or ">>> stream" in line
-                            or "<<< stream" in line
                             or '"encrypted_content"' in line
                             or ('"type":"response.' in line and len(line) > 150)):
                         continue
@@ -508,6 +685,7 @@ class OpenCodeClient(AgentClient):
                         self._print_tool_call(tool_name, elapsed)
                         printed = True
                         continue
+                    self._proxy_stream_chars += len(line)
                     self._print_token_line(line)
                     printed = True
                 else:
@@ -517,11 +695,12 @@ class OpenCodeClient(AgentClient):
                     buf_len = len(self._line_buf)
                     if buf_len >= 80 and "\n" not in self._line_buf:
                         text = self._line_buf.strip()
-                        # Keep accumulating [TOOL lines until newline (up to 500 char safety limit)
-                        if text.startswith("[TOOL") and buf_len < 500:
-                            pass  # keep accumulating
+                        # Keep accumulating [TOOL / stream marker lines until newline
+                        if (text.startswith("[TOOL") or ">>> stream" in text or "<<< stream" in text) and buf_len < 500:
+                            pass  # keep accumulating until newline
                         else:
-                            if text and "[DBG" not in text and ">>> stream" not in text and "<<< stream" not in text:
+                            if text and "[DBG" not in text:
+                                self._proxy_stream_chars += len(text)
                                 self._print_token_line(text)
                                 printed = True
                             self._line_buf = ""
@@ -544,6 +723,7 @@ class OpenCodeClient(AgentClient):
         prompt = text
         trace: list[dict[str, Any]] = []
         self._stale_timeout_event = threading.Event()  # reset per run
+        cumulative_tokens: dict[str, int] = {"input": 0, "output": 0, "reasoning": 0}
         for turn_idx in range(self._max_turns):
             monitor = None
             if on_turn:
@@ -569,6 +749,16 @@ class OpenCodeClient(AgentClient):
             finally:
                 if monitor:
                     monitor.stop()
+
+            # Extract and display context/token info
+            ctx_info = self._extract_context_info(msg)
+            if ctx_info is not None:
+                cumulative_tokens["input"] += ctx_info["input"]
+                cumulative_tokens["output"] += ctx_info["output"]
+                cumulative_tokens["reasoning"] += ctx_info["reasoning"]
+                session_total = cumulative_tokens["input"] + cumulative_tokens["output"] + cumulative_tokens["reasoning"]
+                self._print_context_status(turn_idx + 1, ctx_info, session_total)
+
             opencode_err = None
             if isinstance(msg, dict):
                 info = msg.get("info")
@@ -604,14 +794,15 @@ class OpenCodeClient(AgentClient):
                     assistant_text = "\n".join(texts) or str(msg)
             calls = parse_tool_calls(assistant_text)
             if not calls:
-                trace.append(
-                    {
-                        "turn": int(turn_idx + 1),
-                        "assistant_text_tail": tail(assistant_text or "", 4000),
-                        "calls": [],
-                        "results": [],
-                    }
-                )
+                _trace_entry: dict[str, Any] = {
+                    "turn": int(turn_idx + 1),
+                    "assistant_text_tail": tail(assistant_text or "", 4000),
+                    "calls": [],
+                    "results": [],
+                }
+                if ctx_info is not None:
+                    _trace_entry["tokens"] = ctx_info
+                trace.append(_trace_entry)
                 if on_turn:
                     on_turn(TurnEvent(turn=turn_idx + 1, assistant_text=assistant_text, finished=True))
                 return AgentResult(assistant_text=assistant_text, raw=msg, tool_trace=trace)
@@ -640,20 +831,21 @@ class OpenCodeClient(AgentClient):
                         results=[results_list[call_idx]],
                     ))
 
-            trace.append(
-                {
-                    "turn": int(turn_idx + 1),
-                    "assistant_text_tail": tail(assistant_text or "", 4000),
-                    "calls": [
-                        {
-                            "kind": str(c.kind),
-                            "payload": c.payload if isinstance(c.payload, (dict, list, str, int, float, bool)) else str(c.payload),
-                        }
-                        for c in calls_list
-                    ],
-                    "results": compact_results,
-                }
-            )
+            _trace_entry2: dict[str, Any] = {
+                "turn": int(turn_idx + 1),
+                "assistant_text_tail": tail(assistant_text or "", 4000),
+                "calls": [
+                    {
+                        "kind": str(c.kind),
+                        "payload": c.payload if isinstance(c.payload, (dict, list, str, int, float, bool)) else str(c.payload),
+                    }
+                    for c in calls_list
+                ],
+                "results": compact_results,
+            }
+            if ctx_info is not None:
+                _trace_entry2["tokens"] = ctx_info
+            trace.append(_trace_entry2)
 
             # For scaffold runs, we don't need the agent to "finish talking" if the contract
             # is already valid. Some models keep emitting extra tool calls indefinitely.
@@ -700,10 +892,32 @@ class OpenCodeClient(AgentClient):
                 env["OPENAI_BASE_URL"] = api_base if api_base.endswith("/v1") else (api_base + "/v1")
         env["OPENCODE_SERVER_USERNAME"] = user
         env["OPENCODE_SERVER_PASSWORD"] = pwd
+        if self._auto_compact is False:
+            env["OPENCODE_DISABLE_AUTOCOMPACT"] = "true"
 
         # --- Start LLM streaming proxy ---
         if server_log_path is not None:
             self._start_llm_proxy(env, server_log_path.parent)
+
+        # If proxy didn't create a temp config but we have permission overrides,
+        # create a temp config now to inject them.
+        if self._permission_overrides and not hasattr(self, "_temp_config_home"):
+            xdg = str(env.get("XDG_CONFIG_HOME") or "").strip()
+            cfg_home = Path(xdg) if xdg else Path.home() / ".config"
+            cfg_path = cfg_home / "opencode" / "opencode.json"
+            if cfg_path.exists():
+                import copy
+                cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+                perms = cfg.setdefault("permission", {})
+                for pk, pv in self._permission_overrides.items():
+                    perms[pk] = pv
+                self._temp_config_home = Path(tempfile.mkdtemp(prefix="opencode_perm_"))
+                tmp_dir = self._temp_config_home / "opencode"
+                tmp_dir.mkdir(parents=True)
+                (tmp_dir / "opencode.json").write_text(
+                    json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8",
+                )
+                env["XDG_CONFIG_HOME"] = str(self._temp_config_home)
 
         cmd = ["opencode", "serve", "--hostname", host, "--port", str(port)]
 
@@ -818,6 +1032,11 @@ class OpenCodeClient(AgentClient):
             import copy
             patched = copy.deepcopy(config_data)
             patched["provider"][provider_id]["options"]["baseURL"] = proxy_base
+            # Inject permission overrides (key is "permission" singular in OpenCode)
+            if self._permission_overrides:
+                perms = patched.setdefault("permission", {})
+                for perm_key, perm_val in self._permission_overrides.items():
+                    perms[perm_key] = perm_val
             self._temp_config_home = Path(tempfile.mkdtemp(prefix="opencode_proxy_"))
             temp_cfg_dir = self._temp_config_home / "opencode"
             temp_cfg_dir.mkdir(parents=True)

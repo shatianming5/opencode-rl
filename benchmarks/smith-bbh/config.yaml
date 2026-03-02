@@ -1,0 +1,9 @@
+description: 'BIG-Bench Hard (BBH): 27 challenging multi-step reasoning tasks from
+  BIG-bench, evaluated by exact-match final answers.'
+eval_mode: opencompass
+expose_files:
+- eval.py
+- download_data.py
+name: smith-bbh
+opencompass_dataset: opencompass.configs.datasets.bbh.bbh_gen_ee62e9
+task_type: reasoning

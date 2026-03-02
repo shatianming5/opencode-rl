@@ -1,0 +1,9 @@
+description: AI2 ARC (Challenge) multiple-choice science questions; answer with the
+  correct option label.
+eval_mode: opencompass
+expose_files:
+- eval.py
+- download_data.py
+name: smith-arc_solvers
+opencompass_dataset: opencompass.configs.datasets.ARC_c.ARC_c_gen_1e0de5
+task_type: qa

@@ -6,119 +6,6 @@ from pathlib import Path
 from .types import IterationResult
 
 
-def build_verifier_prompt(
-    workspace: str,
-    data_path: str,
-    task_description: str,
-) -> str:
-    """构建验证器生成阶段的 prompt — Phase 0。
-
-    让 Agent 分析 benchmark 数据格式，编写 verifier.py。
-    Agent 不知道后续训练代码的存在，只关注验证逻辑。
-    """
-    train_jsonl = str(Path(data_path) / "train.jsonl") if Path(data_path).is_dir() else data_path
-    verifier_path = f"{workspace}/code/verifier.py"
-
-    return f"""你是一个评测验证器工程师。你的任务是编写一个验证函数，判断模型生成的 completion 是否正确。
-
-## 任务描述
-{task_description.strip()}
-
-## 数据路径
-- 训练数据：{train_jsonl}
-
-## 第一步：探索数据格式（必须先做）
-
-用 terminal 执行以下命令，理解数据结构：
-
-```bash
-# 查看前 3 条数据，理解字段和格式
-head -3 {train_jsonl}
-
-# 用 python 分析字段结构
-python3 -c "
-import json
-with open('{train_jsonl}') as f:
-    sample = json.loads(f.readline())
-for k, v in sample.items():
-    print(f'  {{k}} ({{type(v).__name__}}): {{repr(v)[:300]}}')
-"
-```
-
-## 第二步：编写验证器
-
-根据数据格式，编写 `{verifier_path}`，实现以下接口：
-
-```python
-def verify(completion: str, sample: dict) -> dict:
-    \"\"\"验证单个 completion 的正确性。
-
-    Args:
-        completion: 模型生成的文本
-        sample: train.jsonl 中的原始数据（包含 question, answer, test 等字段）
-
-    Returns:
-        {{"passed": bool, "reward": float, "reason": str}}
-        - passed: 是否通过验证
-        - reward: 1.0（通过）或 0.0（不通过）
-        - reason: 判定原因的简短描述
-    \"\"\"
-```
-
-## 验证器编写要求
-
-1. **代码类任务**（如果数据中有 test/entry_point 等字段）：
-   - 从 completion 中提取代码（处理 markdown 代码块包裹的情况）
-   - 拼接 test 函数后用 exec() 执行
-   - 设置超时保护（5 秒），用 signal 或 multiprocessing
-   - 捕获所有异常，执行失败 = 不通过
-
-2. **数学类任务**（如果数据中有数值型 answer）：
-   - 从 completion 中提取最终数字答案
-   - 与标准答案比较（容忍格式差异：逗号、$符号、空格等）
-
-3. **通用要求**：
-   - 函数必须是纯函数，不依赖外部状态
-   - 必须处理 completion 为空字符串的情况（返回 passed=False）
-   - 不能抛出异常，所有错误都应 catch 并返回 passed=False
-   - 不要在 verify() 函数外做 import 以外的操作（不要有 main 或 side effects）
-
-## 第三步：自测验证器
-
-编写完成后，必须自测：
-
-```python
-python3 -c "
-import json, sys
-sys.path.insert(0, '{workspace}/code')
-from verifier import verify
-
-with open('{train_jsonl}') as f:
-    sample = json.loads(f.readline())
-
-# 正确答案应通过
-answer = sample.get('answer') or sample.get('canonical_solution') or sample.get('response', '')
-result = verify(answer, sample)
-print(f'Correct answer test: {{result}}')
-assert result['passed'], f'FAIL: correct answer not passed: {{result}}'
-
-# 空字符串应不通过
-result_empty = verify('', sample)
-print(f'Empty string test: {{result_empty}}')
-assert not result_empty['passed'], f'FAIL: empty string passed: {{result_empty}}'
-
-print('All tests passed!')
-"
-```
-
-如果自测失败，修复并重新测试，直到通过。
-
-## 约束
-- 只写 `{verifier_path}`，不要写其他文件
-- 完成后调用 finish 工具结束
-"""
-
-
 def build_code_prompt(
     iteration: int,
     workspace: str,
@@ -126,8 +13,10 @@ def build_code_prompt(
     task_description: str,
     history: list[IterationResult],
     gpu_info: dict | None = None,
+    task_type: str = "math",
+    expose_files: tuple[str, ...] = (),
 ) -> str:
-    """构建代码生成阶段的 prompt — 探索式，让 agent 自主发现数据格式和设计方案。"""
+    """构建代码生成阶段的 prompt — 根据 task_type 自动切换引导内容。"""
     model_path = os.environ.get("MODEL_PATH", "")
     data_path = os.environ.get("DATA_PATH", "")
     output_dir = os.environ.get("OUTPUT_DIR", "")
@@ -137,18 +26,34 @@ def build_code_prompt(
     if gpu_info:
         gpu_section = f"- 硬件：{gpu_info['num_gpus']}x {gpu_info['gpu_name']}"
 
+    # expose_files 列表
+    expose_section = ""
+    if expose_files:
+        files_list = "\n".join(f"  - {workspace}/{f}" for f in expose_files)
+        expose_section = f"- 参考文件（已拷贝到工作空间）：\n{files_list}"
+
+    # 根据 task_type 切换数据和训练方式说明
+    if task_type == "interactive":
+        data_section = f"- 训练数据：这是交互式环境任务，数据目录 {data_path}/ 仅供参考，核心训练信号来自环境交互"
+        method_hints = """- 仔细阅读工作空间中的参考文件，理解环境 API、交互协议和评测逻辑
+- 先读 description.md 了解任务目标和环境交互方式"""
+    else:
+        data_section = f"- 训练数据：{data_path}/train.jsonl"
+        method_hints = """- 可以用 `head -5 {data_path}/train.jsonl` 查看数据
+- TRL 的 GRPOTrainer 适合这类 RL 后训练任务""".format(data_path=data_path)
+
     history_section = ""
     if history:
         rows = []
         for h in history:
             score_s = f"{h.score:.2f}" if h.score is not None else "-"
-            agent_s = f"{h.agent_score:.2f}" if h.agent_score is not None else "-"
+            improvement_s = f"{h.improvement:+.2f}" if h.improvement is not None else "-"
             status = "OK" if h.exit_code == 0 else f"FAIL({h.exit_code})"
-            rows.append(f"| {h.iteration} | {status} | {h.training_time:.0f}s | {score_s} | {agent_s} |")
+            rows.append(f"| {h.iteration} | {status} | {h.training_time:.0f}s | {score_s} | {improvement_s} |")
 
         history_section = "\n## 历史记录\n"
-        history_section += "| 轮次 | 状态 | 耗时 | 管线验证分数 | Agent自报分数 |\n"
-        history_section += "|------|------|------|-------------|-------------|\n"
+        history_section += "| 轮次 | 状态 | 耗时 | 评测分数 | vs Baseline |\n"
+        history_section += "|------|------|------|---------|-------------|\n"
         history_section += "\n".join(rows) + "\n"
 
         # 注入上一轮的分析报告，让 agent 直接获得之前的诊断洞察
@@ -157,40 +62,30 @@ def build_code_prompt(
             history_section += f"\n## 上一轮诊断报告（第 {last.iteration} 轮）\n"
             history_section += last.analysis.strip()[:3000] + "\n"
 
-        # 注入上一轮评测样本统计
-        if last.samples_path:
-            from .utils import get_rollout_samples_stats
-            stats = get_rollout_samples_stats(last.samples_path)
-            if stats:
-                history_section += f"\n## 上一轮评测统计\n"
-                history_section += f"- 样本数：{stats['total_samples']}\n"
-                history_section += f"- 平均评测得分：{stats['avg_eval_score']}\n"
-                history_section += f"- 评测通过率：{stats['pass_rate']}\n"
-                history_section += f"- 平均 completion 长度：{stats['avg_completion_len']} 字符\n"
-                history_section += f"- 评测样本文件：{last.samples_path}（可用 head 查看具体样本）\n"
-
         history_section += f"""
 ## 上一轮文件
 - 上一轮代码：{workspace}/code/train.py
 - 上一轮训练日志：{workspace}/code/training_stdout.log
 
-请根据上面的诊断报告、评测统计和历史分数，针对性地改进代码。如果需要更多信息，可以自行读取日志、样本和代码。
+请根据上面的诊断报告和历史分数，针对性地改进代码。如果需要更多信息，可以自行读取日志和代码。
 """
 
     return f"""你是 RL 后训练工程师。目标：写一个训练脚本来提升模型在下面任务上的性能。
 
 ## 工作空间
 - 代码目录：{workspace}/code/（在这里写 train.py）
-- 训练数据：{data_path}/train.jsonl
+{data_section}
 - 基础模型：{model_path}（{base_model}）
 - 输出目录：{output_dir}（训练后的模型保存在这里）
 - 任务描述：{workspace}/description.md
+{expose_section}
 {gpu_section}
 
 ## 你的任务
-1. 先探索：用 terminal 查看数据格式、读 description.md、了解任务要求
-2. 再设计：选择训练方法、设计训练 reward 函数、确定超参数
+1. 先探索：读 description.md（用 read limit=20）、了解任务要求、**采样**参考文件（head -3）
+2. 再设计：选择训练方法、设计 reward 函数、确定超参数
 3. 最后写代码：生成 {workspace}/code/train.py
+⚠️ 探索时 **绝对不要** 一次性读取整个数据文件，只采样前 3-5 条了解格式
 
 ## 输出合约
 - 文件：{workspace}/code/train.py
@@ -198,43 +93,35 @@ def build_code_prompt(
 - 环境变量：MODEL_PATH, DATA_PATH, OUTPUT_DIR 在运行时可用
 - 预装库：torch, transformers, trl, datasets, accelerate, peft（禁止 pip install）
 - 训练超时：{training_timeout} 秒
-- 训练完成后必须把模型保存到 $OUTPUT_DIR
-
-## 评测模式合约（--eval-only）
-
-train.py 必须支持 --eval-only 参数。传入时：
-1. 不训练，跳过 GRPOTrainer
-2. 从 $OUTPUT_DIR 加载训练后模型（自动检测 LoRA adapter）
-3. 对 train.jsonl 全量样本生成 completion（用训练时相同的 prompt 格式 + chat template）
-4. 输出 $OUTPUT_DIR/samples.jsonl（每行 JSON：prompt, completion, reward, task_id）
-5. 每 10 条打印 [Eval] done/total
-6. 结束时打印总结
-
-注意：管线会用独立的验证器对 completion 进行评分。你的 reward 字段仅供参考。
-重要：确保 completion 字段包含模型的完整输出，管线验证器需要从中提取答案。
-
-LoRA 加载模式：
-  if adapter_config.json 存在 → PeftModel.from_pretrained + merge_and_unload
-  else → AutoModelForCausalLM.from_pretrained
+- 训练完成后必须把**完整模型**保存到 $OUTPUT_DIR（如果用了 LoRA，必须 merge_and_unload() 后再保存，确保目录包含 config.json 和 model.safetensors）
+- Pipeline 会用 vLLM 加载 $OUTPUT_DIR 里的模型评测，只能加载完整模型，不能加载单独的 LoRA adapter
 
 ## 任务描述
 {task_description}
 
 ## 提示
 - 可以用 `python3 -c "..."` 快速验证想法
-- 可以用 `head -5 {data_path}/train.jsonl` 查看数据
-- TRL 的 GRPOTrainer 适合这类 RL 后训练任务
+{method_hints}
 - 你只负责写代码，不要自己执行训练脚本。pipeline 会用 accelerate 自动运行
-- 不要修改 {workspace}/code/verifier.py（如果存在），那是管线锁定的验证器
 - 完成后调用 finish 工具结束
 
-## 重要：文件读取限制
-- **禁止用 read 工具读取超过 500 行的文件**，这会导致系统卡死
-- 查看大型库文件（如 trl 源码、transformers 源码）时，只用 bash 命令：
-  - `python3 -c "import inspect; from trl import GRPOTrainer; print(inspect.signature(GRPOTrainer.__init__))"` 查看函数签名
-  - `grep -n 'def method_name' /path/to/file.py` 定位函数位置
-  - `sed -n '100,150p' /path/to/file.py` 读取指定行范围
-- **绝对不要** read 整个 `grpo_trainer.py`、`modeling_*.py` 等库源码文件
+## CRITICAL: Context Size Limits（违反会导致 session 崩溃）
+- **绝对禁止** 一次性读取整个数据文件（jsonl、csv、parquet 等），这些文件可能有数万行，
+  单次读取会直接撑爆 LLM context window，导致 session 崩溃、timeout、无法恢复
+- 查看数据格式：只用 `head -3 file` 或 `python3 -c "..."` 采样前 3-5 条
+- read 工具：**必须设置 limit=20**，用 offset 翻页
+- grep：加 `-m 10` 限制匹配数量，如 `grep -n 'pattern' file | head -10`
+- 大日志文件：先 `wc -l` 看行数，再 `tail -30` 看末尾
+- **错误示例（绝对禁止）**：`cat file.py`、`cat data.jsonl`、不带 limit 的 read、`sed -n '1,500p'`、不加限制的 grep
+- **正确示例**：`head -3 train.jsonl`、`read file limit=20`、`grep -n 'error' log | head -10`
+
+## 效率要求（严格遵守）
+- **禁止用 inspect.getsource() 逐函数阅读库源码**，这会导致上下文爆炸、LLM 响应超时
+- 了解库 API：用 `python3 -c "from trl import GRPOTrainer; help(GRPOTrainer)"` 查看文档
+- 验证参数签名：用 `python3 -c "import inspect; from trl import GRPOConfig; print(inspect.signature(GRPOConfig))"`
+- **不要花超过 3 步探索**，尽快开始写代码。你已经知道 TRL、transformers、PEFT 的基本用法
+- 写完代码后立即调用 finish，不要反复检查和优化
+- **DO NOT read entire data files** — 只采样前几条理解格式即可
 {history_section}"""
 
 
@@ -253,17 +140,21 @@ def build_fix_prompt(
 - 训练数据：{data_path}（只读）
 
 ## 你的任务
-1. 读错误日志，理解出了什么问题
-2. 读当前代码，找到 bug
-3. 如果需要，检查训练数据验证你的理解
+1. 读错误日志（`tail -30` 看末尾），理解出了什么问题
+2. 读当前代码（read limit=20，分段读），找到 bug
+3. 如果需要，**采样**训练数据验证理解（`head -3`，禁止读取整个数据文件）
 4. 可以跑小段测试代码验证修复
 5. 修改 {code_path}
 6. 不要运行完整训练——pipeline 会执行
 7. 完成后调用 finish 工具结束
 
-## 重要：文件读取限制
-- **禁止用 read 工具读取超过 500 行的文件**，会导致系统卡死
-- 查看库源码时用 `grep -n`、`sed -n 'N,Mp'`、`python3 -c "import inspect; ..."` 等方式只看关键片段
+## CRITICAL: Context Size Limits（违反会导致 session 崩溃）
+- **绝对禁止** 一次性读取整个数据文件或大日志——会撑爆 context window
+- read 工具：**必须设置 limit=20**，用 offset 翻页
+- grep：加 `-m 10`，如 `grep -n 'error' log | head -10`
+- 大日志：先 `wc -l` 看行数，再 `tail -30` 看末尾
+- **禁止用 inspect.getsource() 读库源码**
+- **DO NOT read entire data files** — 只采样前几条
 """
 
 
@@ -273,146 +164,43 @@ def build_analysis_prompt(
     code_path: str,
     training_log_path: str,
     score: float | None,
-    samples_path: str = "",
-    verification_summary: str = "",
+    evaluation_summary: str = "",
 ) -> str:
     """构建自分析 prompt — 探索式，让 agent 自主查阅所有资料写诊断报告。"""
 
-    verification_section = ""
-    if verification_summary:
-        verification_section = f"""
-## 管线独立验证结果
-{verification_summary}
-
-注意：管线验证分数是由独立验证器计算的权威分数，不受 train.py 中的 reward 函数影响。
-如果 Agent 自报分数与管线验证分数差距大，说明 train.py 的 reward 函数有问题。
+    evaluation_section = ""
+    if evaluation_summary:
+        evaluation_section = f"""
+## Grading Server 评测结果
+{evaluation_summary}
 """
 
     return f"""第 {iteration} 轮训练和评测已完成。请分析结果并写出诊断报告。
 
 ## 结果概览
-- 管线验证分数：{score if score is not None else "无（评测失败或未运行）"}
+- 评测分数：{score if score is not None else "无（评测失败或未运行）"}
 
 ## 可用资料（请自行查阅）
 - 任务描述：{workspace}/description.md
 - 训练代码：{code_path}
 - 训练日志：{training_log_path}
-- 评测样本：{samples_path or "（无）"}（JSONL，每行有 prompt/completion/reward 字段）
-{verification_section}
+{evaluation_section}
 ## 你的任务
-分析训练过程：读代码、日志、评测样本。理解发生了什么、为什么。
+分析训练过程：读代码（read limit=20 分段）、日志（tail -30 看末尾）。理解发生了什么、为什么。
 
 将分析写入 {workspace}/code/analysis.md，包含：
 - 做得好的和做得不好的地方
 - 性能问题的根因
 - 下一轮的具体改进建议（最多3条，按优先级排序）
 
-用日志和评测样本中的具体数据支撑你的分析（引用评测通过率、loss 趋势、具体样本等）。
+用日志中的具体数据支撑你的分析（引用 loss 趋势等）。
 
-## 重要：文件读取限制
-- **禁止用 read 工具读取超过 500 行的文件**，会导致系统卡死
-- 查看大文件用 `head`、`tail`、`grep -n`、`sed -n 'N,Mp'` 只看关键片段
+## CRITICAL: Context Size Limits（违反会导致 session 崩溃）
+- **绝对禁止** 一次性读取整个日志或数据文件——会撑爆 context window
+- read 工具：**必须设置 limit=20**，用 offset 翻页
+- grep：加 `-m 10`，如 `grep -n 'loss' log | head -10`
+- 大日志：先 `wc -l` 看行数，再 `tail -30` 看末尾
+- **DO NOT read entire data files or log files**
 
 完成后调用 finish 工具结束。
-"""
-
-
-def build_eval_repair_prompt(
-    code_path: str,
-    samples_path: str,
-    data_path: str,
-    task_description: str,
-    pass_count: int,
-    total_samples: int,
-    repair_attempt: int,
-    max_attempts: int,
-    eval_log: str = "",
-) -> str:
-    """构建 --eval-only 零分修复 prompt — 让 OpenCode 自主诊断并修复 train.py 的评测逻辑。"""
-    train_jsonl = str(Path(data_path) / "train.jsonl") if data_path else ""
-
-    eval_log_section = ""
-    if eval_log:
-        tail = eval_log[-3000:]
-        eval_log_section = f"\n## 评测日志（尾部）\n```\n{tail}\n```\n"
-
-    # 区分 crash vs 零分
-    if total_samples == 0:
-        situation = (
-            "train.py --eval-only 执行失败或未产生 samples.jsonl。"
-            "可能是 --eval-only 参数未正确处理、LoRA 加载失败、或脚本崩溃。"
-        )
-    else:
-        situation = (
-            f"train.py --eval-only 产生了 {total_samples} 个样本，"
-            f"但只有 {pass_count} 个通过（通过率 {pass_count}/{total_samples}）。"
-            "评测 reward（通过/不通过判定）逻辑很可能有问题。"
-        )
-
-    # 构建探索命令——仅在 samples_path 非空时包含样本查看
-    if samples_path:
-        samples_explore = f"""# 1. 看模型实际输出了什么
-head -3 {samples_path}
-
-# 4. 用 python 手动跑一条样本的 reward 逻辑，看具体报错
-python3 -c "
-import json
-sample = json.loads(open('{samples_path}').readline())
-data = json.loads(open('{train_jsonl}').readline())
-print('=== Sample ===')
-for k,v in sample.items():
-    print(f'  {{k}}: {{repr(v)[:200]}}')
-print('=== Data ===')
-for k,v in data.items():
-    print(f'  {{k}}: {{repr(v)[:200]}}')
-"
-"""
-    else:
-        samples_explore = "# samples.jsonl 不存在，跳过样本查看。先修复 --eval-only 使其能正常运行并输出 samples.jsonl。\n"
-
-    return f"""{situation}
-这是第 {repair_attempt}/{max_attempts} 次修复尝试。
-
-## 任务描述
-{task_description.strip()}
-{eval_log_section}
-## 第一步：自主探索（必须先做，不要跳过）
-
-用 terminal 执行以下命令，理解当前状况：
-
-```bash
-{samples_explore}
-# 2. 看数据格式和测试用例结构
-head -2 {train_jsonl}
-
-# 3. 看当前 train.py 中的 --eval-only 和 reward 逻辑
-cat {code_path}
-```
-
-根据探索结果，自己判断：
-- 模型输出的 completion 是什么样的？
-- 数据中的测试用例是什么格式？
-- --eval-only 模式的 reward 逻辑为什么判定失败？
-- 常见问题：LoRA 加载失败、reward 函数参数格式差异、prompt 格式不一致、代码提取方式有误
-
-## 第二步：修复 train.py 的评测逻辑
-
-根据探索结果，修复 `{code_path}` 中 --eval-only 模式的评测逻辑。
-
-注意：管线会用独立验证器重新评分，你的 reward 字段仅供参考。
-重要：确保 samples.jsonl 的 completion 字段包含模型的完整原始输出。
-
-## 第三步：验证修复（必须做！）
-
-修复后，必须用 terminal 验证：
-
-1. 取 train.jsonl 第 1 条数据的**正确答案**作为 completion，跑 reward 函数 → 应得 reward=1.0（通过）
-2. 用空字符串或错误答案作为 completion → 应得 reward=0.0（不通过）
-3. 如果结果不对，继续修复并重新验证
-
-## 约束
-- 只修改 `{code_path}`，不要改变训练逻辑，只修复 --eval-only 模式
-- 不要修改 verifier.py（如果存在），那是管线锁定的验证器
-- **禁止用 read 工具读取超过 500 行的文件**（会导致系统卡死），用 grep/sed/head 查看关键片段
-- 完成后调用 finish 工具
 """

@@ -1,0 +1,9 @@
+description: PAL-style program-aided arithmetic word problems (GSM8K-format JSONL
+  from the PaL repo)
+eval_mode: opencompass
+expose_files:
+- eval.py
+- download_data.py
+name: smith-pal
+opencompass_dataset: opencompass.configs.datasets.gsm8k.gsm8k_gen_1d7fe4
+task_type: math

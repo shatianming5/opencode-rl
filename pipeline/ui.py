@@ -107,7 +107,7 @@ def print_iteration_header(iteration: int, max_iterations: int, elapsed: float):
     ))
 
 
-def print_iteration_summary(iteration, score, agent_score,
+def print_iteration_summary(iteration, score, improvement,
                             best_score, best_iteration, elapsed):
     """Print compact iteration summary."""
     tbl = Table(show_header=False, box=None, padding=(0, 1),
@@ -116,11 +116,11 @@ def print_iteration_summary(iteration, score, agent_score,
     tbl.add_column("Value")
 
     s = f"[bright_green]{score}[/]" if score is not None else "[dim]N/A[/]"
-    a = f"{agent_score}" if agent_score is not None else "N/A"
+    imp = f"{improvement}" if improvement is not None else "N/A"
     b = f"[bold bright_green]{best_score}[/] (iter {best_iteration})" if best_score is not None else "N/A"
 
-    tbl.add_row("Pipeline Score", s)
-    tbl.add_row("Agent Score", a)
+    tbl.add_row("Score", s)
+    tbl.add_row("vs Baseline", imp)
     tbl.add_row("Best So Far", b)
     tbl.add_row("Iteration Time", f"{elapsed:.0f}s")
 
@@ -151,32 +151,24 @@ def print_phase_status(msg: str, style: str = ""):
 
 
 # ---------------------------------------------------------------------------
-# Verification report
+# Evaluation report
 # ---------------------------------------------------------------------------
-def print_verification_report(pipeline_score, agent_score, passed, total,
-                              agreement_rate, inflation, fallback=False):
-    """Print verification results panel."""
+def print_evaluation_report(score, improvement, best_score, submission_id=None):
+    """Print evaluation results panel."""
     tbl = Table(show_header=False, box=None, padding=(0, 2),
                 show_edge=False)
     tbl.add_column("Key", style=STYLE_KEY, min_width=20)
     tbl.add_column("Value")
 
-    if fallback:
-        tbl.add_row("Source", "[yellow]Agent self-reported (fallback)[/]")
-    else:
-        tbl.add_row("Source", "[green]Pipeline independent verification[/]")
-
-    tbl.add_row("Passed", f"[bright_green]{passed}[/] / {total}")
-    tbl.add_row("Pipeline Score",
-                f"[bold bright_green]{pipeline_score:.4f}[/]" if pipeline_score else "N/A")
-
-    if not fallback:
-        tbl.add_row("Agent Score", f"{agent_score:.4f}")
-        tbl.add_row("Agreement Rate", f"{agreement_rate * 100:.1f}%")
-
-        inf_style = "bright_red" if inflation > 0.05 else "green"
-        tbl.add_row("Reward Inflation",
-                     f"[{inf_style}]{inflation:+.4f}[/]")
+    tbl.add_row("Source", "[green]Grading Server[/]")
+    tbl.add_row("Score",
+                f"[bold bright_green]{score}[/]" if score is not None else "N/A")
+    tbl.add_row("vs Baseline",
+                f"{improvement}" if improvement is not None else "N/A")
+    tbl.add_row("Best Score",
+                f"[bold bright_green]{best_score}[/]" if best_score is not None else "N/A")
+    if submission_id is not None:
+        tbl.add_row("Submission ID", str(submission_id))
 
     console.print(Panel(tbl,
                         title=Text("Evaluation Results", style="bold"),

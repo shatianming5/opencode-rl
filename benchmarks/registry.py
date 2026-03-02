@@ -19,6 +19,7 @@ class BenchmarkInfo:
     task_type: str
     description: str
     root: Path
+    expose_files: tuple[str, ...] = ()
 
     @property
     def train_jsonl(self) -> Path:
@@ -45,12 +46,15 @@ def discover_benchmarks() -> dict[str, BenchmarkInfo]:
 
         name = str(raw.get("name") or bench_dir.name).strip()
         data_dir = bench_dir / "data"
+        expose_raw = raw.get("expose_files", [])
+        expose_files = tuple(str(f) for f in expose_raw) if isinstance(expose_raw, list) else ()
         info = BenchmarkInfo(
             name=name,
             data_dir=data_dir,
             task_type=str(raw.get("task_type", "unknown")).strip(),
             description=str(raw.get("description", "")).strip(),
             root=bench_dir,
+            expose_files=expose_files,
         )
         result[name] = info
 

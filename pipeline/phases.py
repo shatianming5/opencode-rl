@@ -5,9 +5,10 @@
 
 import os
 import subprocess
-import sys
 import time
 from pathlib import Path
+
+import requests
 
 from runner_fsm.opencode.client import OpenCodeClient
 
@@ -15,7 +16,6 @@ from .prompts import (
     build_analysis_prompt,
     build_code_prompt,
     build_fix_prompt,
-    build_verifier_prompt,
 )
 from .stream import make_stream_printer
 from .types import IterationResult, PhaseResult
@@ -39,84 +39,6 @@ def _cap_stdout(collected: list[str]) -> str:
     return head + "\n...[TRUNCATED]...\n" + tail_part
 
 
-def phase_verifier_generation(
-    workspace: str,
-    data_path: str,
-    task_description: str,
-    max_agent_steps: int = 30,
-    opencode_model: str = "",
-    opencode_url: str = "",
-    stale_timeout: float = 180.0,
-    http_timeout: float = 300.0,
-) -> PhaseResult:
-    """Phase 0: 验证器生成
-
-    让 Agent 分析 benchmark 数据格式，编写 verifier.py。
-    仅在第一轮迭代前执行一次。
-    """
-    model = opencode_model or os.environ.get("OPENCODE_MODEL", "")
-    server_url = opencode_url or os.environ.get("OPENCODE_URL", "") or None
-
-    repo_root = Path(workspace).resolve()
-    log_dir = repo_root / "code" / "agent_logs"
-    log_dir.mkdir(parents=True, exist_ok=True)
-
-    prompt = build_verifier_prompt(workspace, data_path, task_description)
-    console.print(f"  [dim]Prompt:[/] {len(prompt)} chars  [dim]Model:[/] {model}  [dim]Starting server...[/]")
-
-    agent = OpenCodeClient(
-        repo=repo_root,
-        plan_rel="PLAN.md",
-        pipeline_rel=None,
-        model=model,
-        base_url=server_url,
-        timeout_seconds=http_timeout,
-        bash_mode="full",
-        scaffold_bash_mode="full",
-        unattended="strict",
-        max_turns=max_agent_steps,
-        server_log_path=log_dir / "opencode_verifier_gen.log",
-        session_title="verifier_generation",
-        stale_timeout=stale_timeout,
-    )
-
-    try:
-        result = agent.run(
-            prompt,
-            fsm_state="S0_VERIFY_GEN",
-            iter_idx=0,
-            purpose="verifier_generation",
-            on_turn=make_stream_printer("VerifierGen"),
-        )
-        if result.assistant_text:
-            (log_dir / "verifier_gen_result.txt").write_text(
-                result.assistant_text[-20000:], encoding="utf-8",
-            )
-    except Exception as e:
-        return PhaseResult(
-            success=False, phase="verify_gen",
-            error=f"Agent error: {e}",
-        )
-    finally:
-        try:
-            agent.close()
-        except Exception:
-            pass
-
-    verifier_path = repo_root / "code" / "verifier.py"
-    if verifier_path.exists():
-        console.print(f"  [green]Verifier generated:[/] {verifier_path} [dim]({verifier_path.stat().st_size} bytes)[/]")
-        return PhaseResult(
-            success=True, phase="verify_gen",
-            payload={"verifier_path": str(verifier_path)},
-        )
-    else:
-        return PhaseResult(
-            success=False, phase="verify_gen",
-            error=f"verifier.py not found after agent finished",
-        )
-
-
 def phase_code_generation(
     iteration: int,
     workspace: str,
@@ -129,6 +51,8 @@ def phase_code_generation(
     opencode_url: str = "",
     stale_timeout: float = 180.0,
     http_timeout: float = 300.0,
+    task_type: str = "math",
+    expose_files: tuple[str, ...] = (),
 ) -> PhaseResult:
     """Phase 1: 代码生成
 
@@ -146,6 +70,8 @@ def phase_code_generation(
     prompt = build_code_prompt(
         iteration, workspace, base_model, task_description, history,
         gpu_info=gpu_info,
+        task_type=task_type,
+        expose_files=expose_files,
     )
     console.print(f"  [dim]Prompt:[/] {len(prompt)} chars  [dim]Model:[/] {model}  [dim]Starting server...[/]")
 
@@ -163,6 +89,10 @@ def phase_code_generation(
         server_log_path=log_dir / f"opencode_codegen_iter{iteration}.log",
         session_title=f"code_generation_iter{iteration}",
         stale_timeout=stale_timeout,
+        auto_compact=True,
+        context_length=128000,
+        max_prompt_chars=80000,
+        permission_overrides={"external_directory": {"*": "allow"}},
     )
 
     try:
@@ -240,14 +170,24 @@ def phase_training(
             text=True,
             bufsize=1,
             env={**os.environ, "PYTHONUNBUFFERED": "1"},
+            start_new_session=True,  # create process group for clean kill
         )
         try:
             deadline = time.time() + timeout
             while True:
                 remaining = deadline - time.time()
                 if remaining <= 0:
-                    proc.kill()
-                    proc.wait()
+                    # Kill entire process group (parent + all children)
+                    import signal
+                    try:
+                        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                        proc.wait(timeout=10)
+                    except Exception:
+                        try:
+                            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                        except Exception:
+                            proc.kill()
+                        proc.wait()
                     collected.append(f"\n  TIMEOUT after {timeout}s")
                     console.print(f"  [bold red]TIMEOUT after {timeout}s[/]")
                     break
@@ -293,90 +233,95 @@ def phase_training(
     )
 
 
-def phase_eval_generate(
+def phase_evaluation(
     workspace: str,
-    code_path: str,
-    timeout: int = 1800,
+    grading_url: str,
+    output_dir: str,
+    timeout: int = 600,
 ) -> PhaseResult:
-    """Phase Eval Generate: 运行 --eval-only 仅生成 completion。
+    """Evaluation 阶段：找到训练产出的模型，POST 到 Grading Server。"""
+    print_phase_header("Evaluation", "submit to Grading Server")
 
-    用 python（不用 accelerate launch），评测不需要 DDP。
-    """
-    print_phase_header("Eval Generate", "--eval-only (generate completions)")
+    # 1. 找 output_dir 下最新模型目录
+    out_path = Path(output_dir)
+    if not out_path.exists():
+        return PhaseResult(
+            success=False, phase="evaluation",
+            error=f"Output dir not found: {output_dir}",
+        )
 
-    if not Path(code_path).exists():
-        msg = f"Code file not found: {code_path}"
-        console.print(f"  [bold red]ERROR:[/] {msg}")
-        return PhaseResult(success=False, phase="eval_generate", error=msg)
+    # 检测模型位置：优先使用 output_dir 根目录（有模型文件时），
+    # 否则在子目录中找（排除 checkpoint-* 中间产物）
+    _MODEL_MARKERS = {"config.json", "adapter_config.json", "model.safetensors",
+                      "adapter_model.safetensors", "pytorch_model.bin"}
+    model_path = str(out_path)
+    root_has_model = bool(_MODEL_MARKERS & {f.name for f in out_path.iterdir() if f.is_file()})
+    if not root_has_model:
+        try:
+            subdirs = [
+                d for d in out_path.iterdir()
+                if d.is_dir() and not d.name.startswith((".", "checkpoint-"))
+            ]
+            if subdirs:
+                model_path = str(max(subdirs, key=lambda d: d.stat().st_mtime))
+        except OSError:
+            pass
 
-    abs_code_path = str(Path(code_path).resolve())
-    start = time.time()
+    console.print(f"  [dim]Model path:[/] {model_path}")
 
-    cmd = [sys.executable, abs_code_path, "--eval-only"]
-    console.print(f"  [dim]CMD:[/] {' '.join(cmd)}")
-
-    collected: list[str] = []
-    exit_code = -1
+    # 2. POST to Grading Server
+    submit_url = f"{grading_url.rstrip('/')}/submit"
+    console.print(f"  [dim]Submitting to:[/] {submit_url}")
 
     try:
-        proc = subprocess.Popen(
-            cmd,
-            cwd=str(Path(workspace).resolve()),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-            env={**os.environ, "PYTHONUNBUFFERED": "1"},
+        resp = requests.post(
+            submit_url,
+            json={"model_path": model_path},
+            timeout=timeout,
         )
-        try:
-            deadline = time.time() + timeout
-            while True:
-                remaining = deadline - time.time()
-                if remaining <= 0:
-                    proc.kill()
-                    proc.wait()
-                    collected.append(f"\n  TIMEOUT after {timeout}s")
-                    console.print(f"  [bold red]TIMEOUT after {timeout}s[/]")
-                    break
-                line = proc.stdout.readline()
-                if not line and proc.poll() is not None:
-                    break
-                if line:
-                    line = line.rstrip("\n")
-                    if len(collected) < _MAX_COLLECTED_LINES:
-                        collected.append(line)
-                    elif len(collected) == _MAX_COLLECTED_LINES:
-                        collected.append(f"...[TRUNCATED at {_MAX_COLLECTED_LINES} lines]...")
-                    console.print(f"  [dim]\\[eval][/] {line}")
-        finally:
-            try:
-                proc.stdout.close()
-            except Exception:
-                pass
-            proc.wait()
-        exit_code = proc.returncode if proc.returncode is not None else -1
+        resp.raise_for_status()
+        data = resp.json()
+    except requests.exceptions.ConnectionError as e:
+        return PhaseResult(
+            success=False, phase="evaluation",
+            error=f"Cannot connect to Grading Server at {grading_url}: {e}",
+        )
+    except requests.exceptions.Timeout:
+        return PhaseResult(
+            success=False, phase="evaluation",
+            error=f"Grading Server request timed out ({timeout}s)",
+        )
+    except requests.exceptions.HTTPError as e:
+        return PhaseResult(
+            success=False, phase="evaluation",
+            error=f"Grading Server returned error: {e}",
+        )
     except Exception as e:
-        collected.append(f"Exception: {e}")
-        console.print(f"  [bold red]Exception:[/] {e}")
+        return PhaseResult(
+            success=False, phase="evaluation",
+            error=f"Grading Server error: {e}",
+        )
 
-    stdout = _cap_stdout(collected)
-    elapsed = time.time() - start
-    ec_style = "green" if exit_code == 0 else "red"
-    console.print(f"  [dim]Exit code:[/] [{ec_style}]{exit_code}[/]  [dim]Time:[/] {elapsed:.1f}s")
+    score = data.get("score")
+    improvement = data.get("improvement")
+    best = data.get("best", {})
+    submission_id = data.get("submission_id")
 
-    if exit_code != 0:
-        tail = "\n".join(stdout.strip().splitlines()[-15:])
-        console.print(f"  [dim]Error tail:[/]\n{tail}")
+    console.print(f"  [green]Score:[/] {score}")
+    if improvement is not None:
+        console.print(f"  [dim]vs Baseline:[/] {improvement}")
+    if best:
+        console.print(f"  [dim]Best:[/] {best.get('score')}")
 
     return PhaseResult(
-        success=(exit_code == 0),
-        phase="eval_generate",
+        success=True, phase="evaluation",
         payload={
-            "exit_code": exit_code,
-            "stdout": stdout,
-            "elapsed": elapsed,
+            "score": score,
+            "improvement": improvement,
+            "best": best,
+            "submission_id": submission_id,
+            "model_path": model_path,
         },
-        error="" if exit_code == 0 else f"Eval failed with exit code {exit_code}",
     )
 
 
@@ -417,6 +362,10 @@ def phase_fix_training(
         server_log_path=log_dir / f"opencode_fix_iter{iteration}.log",
         session_title=f"fix_training_iter{iteration}",
         stale_timeout=stale_timeout,
+        auto_compact=True,
+        context_length=128000,
+        max_prompt_chars=80000,
+        permission_overrides={"external_directory": {"*": "allow"}},
     )
 
     try:
@@ -450,17 +399,16 @@ def phase_analysis(
     code_path: str,
     training_log_path: str,
     score: float | None = None,
-    samples_path: str = "",
     opencode_model: str = "",
     opencode_url: str = "",
     max_agent_steps: int = 30,
-    verification_summary: str = "",
+    evaluation_summary: str = "",
     stale_timeout: float = 180.0,
     http_timeout: float = 300.0,
 ) -> PhaseResult:
     """Phase Analysis: 自分析诊断
 
-    让 OpenCode 阅读训练日志、rollout 样本、当前代码，
+    让 OpenCode 阅读训练日志、当前代码，
     输出 analysis.md 诊断报告，供下一轮代码生成参考。
     """
     print_phase_header("Analysis", f"self-diagnosis (iteration {iteration})")
@@ -474,8 +422,8 @@ def phase_analysis(
 
     prompt = build_analysis_prompt(
         iteration, workspace, code_path, training_log_path,
-        score, samples_path,
-        verification_summary=verification_summary,
+        score,
+        evaluation_summary=evaluation_summary,
     )
     console.print(f"  [dim]Prompt:[/] {len(prompt)} chars  [dim]Model:[/] {model}  [dim]Starting server...[/]")
 
@@ -493,6 +441,10 @@ def phase_analysis(
         server_log_path=log_dir / f"opencode_analysis_iter{iteration}.log",
         session_title=f"analysis_iter{iteration}",
         stale_timeout=stale_timeout,
+        auto_compact=True,
+        context_length=128000,
+        max_prompt_chars=80000,
+        permission_overrides={"external_directory": {"*": "allow"}},
     )
 
     analysis_text = ""
@@ -533,21 +485,4 @@ def phase_analysis(
     return PhaseResult(
         success=True, phase="analysis",
         payload={"analysis": analysis_text},
-    )
-
-
-# ---------------------------------------------------------------------------
-# 向后兼容：保留旧的 phase_eval_only 函数签名
-# ---------------------------------------------------------------------------
-def phase_eval_only(
-    workspace: str,
-    code_path: str,
-    timeout: int = 1800,
-) -> tuple[int, str, float]:
-    """向后兼容：运行 --eval-only，返回 (exit_code, stdout, elapsed)。"""
-    result = phase_eval_generate(workspace, code_path, timeout)
-    return (
-        result.payload.get("exit_code", -1),
-        result.payload.get("stdout", ""),
-        result.payload.get("elapsed", 0.0),
     )

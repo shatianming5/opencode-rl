@@ -1,0 +1,9 @@
+description: Massive Multitask Language Understanding (MMLU) multiple-choice QA across
+  57 subjects.
+eval_mode: opencompass
+expose_files:
+- eval.py
+- download_data.py
+name: smith-mmlu
+opencompass_dataset: opencompass.configs.datasets.mmlu.mmlu_gen_4d595a
+task_type: qa

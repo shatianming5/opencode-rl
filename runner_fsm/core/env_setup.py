@@ -154,6 +154,7 @@ def open_env(
     seed_stage_skeleton: bool = True,
     write_fallback_pipeline_yml: bool = True,
     agent: AgentClient | None = None,
+    opencode_auto_compact: bool | None = None,
 ) -> EnvHandle:
     from ..utils.repo_resolver import prepare_repo
 
@@ -207,6 +208,7 @@ def open_env(
                         bash_mode=str(opencode_bash or "restricted"),
                         scaffold_bash_mode=str(scaffold_opencode_bash or "full"),
                         unattended=str(unattended or "strict"),
+                        auto_compact=opencode_auto_compact,
                         server_log_path=out_dir / "opencode_server.log",
                         session_title=f"{repo_root.name}:scaffold",
                         username=(str(os.environ.get("OPENCODE_SERVER_USERNAME") or "opencode").strip() or "opencode")
@@ -215,6 +217,7 @@ def open_env(
                         password=(str(os.environ.get("OPENCODE_SERVER_PASSWORD") or "").strip() or None)
                         if str(opencode_url or "").strip()
                         else None,
+                        permission_overrides={"external_directory": {"*": "allow"}},
                     )
                 hints = suggest_contract_hints(repo_root)
                 if hints.commands:

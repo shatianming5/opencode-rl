@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import queue
 import sys
 import threading
 import time
@@ -398,20 +399,61 @@ class ProxyHandler(BaseHTTPRequestHandler):
             self.wfile.write(data)
             return
 
-        # Streaming: read SSE chunks, log tokens, forward to client
+        # Streaming: read SSE chunks, log tokens, forward to client.
+        # Use a reader thread + queue so heartbeats can be emitted even when
+        # the upstream LLM is silent (e.g. during extended reasoning/thinking).
         _write_log(f"\n[{time.strftime('%H:%M:%S')}] >>> stream start model={model}\n")
         token_count = 0
         raw_lines = 0
         t0 = time.time()
+        _last_heartbeat = t0
+
+        _SENTINEL = None  # signals reader thread is done
+
+        line_q: queue.Queue = queue.Queue(maxsize=256)
+
+        def _reader():
+            """Background thread: blocking readline() → queue."""
+            try:
+                while True:
+                    line = resp.readline()
+                    if not line:
+                        break
+                    line_q.put(line)
+            except Exception as exc:
+                line_q.put(exc)
+            finally:
+                line_q.put(_SENTINEL)
+
+        reader_t = threading.Thread(target=_reader, daemon=True)
+        reader_t.start()
 
         try:
             while True:
-                line = resp.readline()
-                if not line:
+                try:
+                    item = line_q.get(timeout=10.0)
+                except queue.Empty:
+                    # No data from upstream in 10s — emit heartbeat
+                    _now = time.time()
+                    _write_log(f"\n[HEARTBEAT] {raw_lines} chunks {_now - t0:.0f}s\n")
+                    _last_heartbeat = _now
+                    continue
+
+                if item is _SENTINEL:
                     break
+                if isinstance(item, Exception):
+                    raise item
+
+                line = item
                 # Forward raw bytes to OpenCode server
                 self.wfile.write(line)
                 self.wfile.flush()
+
+                # Heartbeat on data arrival too (if interval elapsed)
+                _now = time.time()
+                if _now - _last_heartbeat >= 10.0:
+                    _write_log(f"\n[HEARTBEAT] {raw_lines} chunks {_now - t0:.0f}s\n")
+                    _last_heartbeat = _now
 
                 # Parse SSE data lines for token content
                 text = line.decode("utf-8", errors="replace").strip()

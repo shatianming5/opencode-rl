@@ -1,0 +1,8 @@
+description: Mixed reasoning suite (math/QA/symbolic) from Kojima et al. (NeurIPS
+  2022) used to study Zero-shot-CoT prompting.
+eval_mode: per_sample
+expose_files:
+- eval.py
+- download_data.py
+name: smith-zero_shot_cot
+task_type: reasoning
