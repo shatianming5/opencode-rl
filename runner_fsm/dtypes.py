@@ -12,34 +12,12 @@ class CmdResult:
     timed_out: bool = False
 
 @dataclass(frozen=True)
-class StageResult:
-    ok: bool
-    results: list[CmdResult]
-    failed_index: int | None = None
-
-@dataclass(frozen=True)
-class VerificationResult:
-    ok: bool
-    failed_stage: str | None
-    bootstrap: StageResult | None = None
-    auth: StageResult | None = None
-    tests: StageResult | None = None
-    deploy_setup: StageResult | None = None
-    deploy_health: StageResult | None = None
-    rollout: StageResult | None = None
-    evaluation: StageResult | None = None
-    benchmark: StageResult | None = None
-    metrics_path: str | None = None
-    metrics: dict[str, Any] | None = None
-    metrics_errors: list[str] | None = None
-
-@dataclass(frozen=True)
 class TurnEvent:
     """单轮 agent 交互的事件，用于流式输出。"""
     turn: int
     assistant_text: str = ""
-    calls: list[Any] = ()      # list[ToolCall]
-    results: list[Any] = ()    # list[ToolResult]
+    calls: tuple = ()      # tuple[ToolCall, ...]
+    results: tuple = ()    # tuple[ToolResult, ...]
     finished: bool = False
 
 @dataclass(frozen=True)
@@ -49,7 +27,5 @@ class AgentResult:
     tool_trace: list[dict[str, Any]] | None = None
 
 class AgentClient(Protocol):
-    def run(self, text: str, *, fsm_state: str, iter_idx: int, purpose: str, on_turn: Callable[[TurnEvent], None] | None = None) -> AgentResult:
-        ...
-    def close(self) -> None:
-        ...
+    def run(self, text: str, *, on_turn: Callable[[TurnEvent], None] | None = None) -> AgentResult: ...
+    def close(self) -> None: ...

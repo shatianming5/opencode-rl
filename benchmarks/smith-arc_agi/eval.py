@@ -1,1 +1,1 @@
-/data/userdata/v-tiansha/RD-Agent/rdagent/scenarios/rl/autorl_bench/benchmarks/smith/arc_agi/eval.py
+/data/userdata/v-tiansha/rl-smith/benchmarks/arc_agi/eval.py

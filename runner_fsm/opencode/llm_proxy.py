@@ -20,7 +20,6 @@ from __future__ import annotations
 import argparse
 import json
 import queue
-import sys
 import threading
 import time
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -84,200 +83,78 @@ def _extract_token(chunk: dict) -> str:
         if reasoning:
             return reasoning
 
-    # Non-standard: top-level content
-    if chunk.get("content"):
-        return chunk["content"]
+    # Non-standard: top-level content (string only; list is Anthropic-style below)
+    top_content = chunk.get("content")
+    if isinstance(top_content, str) and top_content:
+        return top_content
 
-    # Anthropic-style: content[].text
-    for block in chunk.get("content") or []:
-        if isinstance(block, dict) and block.get("text"):
-            return block["text"]
+    # Anthropic-style: content[].text (content is a list of blocks)
+    if isinstance(top_content, list):
+        for block in top_content:
+            if isinstance(block, dict) and block.get("text"):
+                return block["text"]
 
     return ""
 
 
 def _log_tool_event(chunk: dict):
-    """从 SSE chunk 中提取 server 端工具调用事件，写入 token log。
-
-    支持两种格式：
-    1. Responses API:
-       - output_item.added: 工具名（立即反馈）
-       - output_item.done: 工具名 + 完整参数（详细信息）
-    2. Chat Completions API: tool_calls delta
-    """
+    """Extract tool call events from SSE chunks and write to token log."""
     event_type = chunk.get("type", "")
 
-    # Responses API: added 事件 → 立即显示工具名
+    # Responses API: added → tool name
     if event_type == "response.output_item.added":
         item = chunk.get("item") or {}
         if item.get("type") == "function_call":
-            name = item.get("name", "unknown")
-            _write_log(f"\n[TOOL] {name}\n")
+            _write_log(f"\n[TOOL] {item.get('name', '?')}\n")
             return
 
-    # Responses API: done 事件 → 解析参数，显示详细信息
+    # Responses API: done → tool name + detail
     if event_type == "response.output_item.done":
         item = chunk.get("item") or {}
         if item.get("type") == "function_call":
-            name = item.get("name", "unknown")
-            args_str = item.get("arguments", "")
-            detail, content_lines = _extract_tool_detail_full(name, args_str)
-            if not detail and args_str:
-                detail = args_str[:150].replace("\n", " ").strip()
-                if len(args_str) > 150:
-                    detail += "..."
+            name = item.get("name", "?")
+            detail = _extract_tool_detail(name, item.get("arguments", ""))
             if detail:
                 _write_log(f"\n[TOOL_DETAIL] {name}: {detail}\n")
-            # 写入额外内容行（文件内容预览、patch diff 等）
-            for cl in content_lines:
-                _write_log(f"[TOOL_CONTENT] {cl}\n")
             return
 
-    # Chat Completions API 格式
+    # Chat Completions API
     for c in chunk.get("choices") or []:
-        delta = c.get("delta") or {}
-        tool_calls = delta.get("tool_calls") or []
-        for tc in tool_calls:
-            func = tc.get("function") or {}
-            name = func.get("name")
+        for tc in (c.get("delta") or {}).get("tool_calls") or []:
+            name = (tc.get("function") or {}).get("name")
             if name:
                 _write_log(f"\n[TOOL] {name}\n")
                 return
 
 
-def _extract_tool_detail_full(name: str, args_str: str) -> tuple[str, list[str]]:
-    """从工具调用参数中提取详情和内容预览。
-
-    返回 (summary_line, content_lines)。
-    summary_line 是一行摘要，content_lines 是额外的内容预览行（最多 15 行）。
-    """
-    detail = _extract_tool_detail(name, args_str)
-    content_lines: list[str] = []
-
-    if not args_str:
-        return detail, content_lines
-
-    try:
-        args = json.loads(args_str)
-    except (json.JSONDecodeError, TypeError):
-        args = None
-
-    if isinstance(args, dict):
-        if name in ("write",):
-            # 显示文件内容预览（前 15 行）
-            content = args.get("content", "")
-            if content:
-                lines = content.splitlines()
-                for line in lines[:15]:
-                    content_lines.append(line[:150])
-                if len(lines) > 15:
-                    content_lines.append(f"... ({len(lines)} lines total)")
-
-        elif name == "edit":
-            # 显示旧代码 → 新代码
-            old = args.get("old_string", "") or args.get("oldString", "")
-            new = args.get("new_string", "") or args.get("newString", "")
-            if old or new:
-                for line in old.splitlines()[:5]:
-                    content_lines.append(f"- {line[:120]}")
-                if len(old.splitlines()) > 5:
-                    content_lines.append(f"  ... ({len(old.splitlines())} lines)")
-                for line in new.splitlines()[:5]:
-                    content_lines.append(f"+ {line[:120]}")
-                if len(new.splitlines()) > 5:
-                    content_lines.append(f"  ... ({len(new.splitlines())} lines)")
-
-        elif name == "apply_patch":
-            # 显示 diff 预览（支持 patchText / patch / diff 多种 key）
-            patch = (args.get("patch", "") or args.get("patchText", "")
-                     or args.get("diff", "") or "")
-            if patch:
-                lines = patch.splitlines()
-                for line in lines[:15]:
-                    content_lines.append(line[:150])
-                if len(lines) > 15:
-                    content_lines.append(f"... ({len(lines)} lines total)")
-
-    return detail, content_lines
-
-
 def _extract_tool_detail(name: str, args_str: str) -> str:
-    """从工具调用参数中提取关键信息用于展示。"""
+    """Extract a concise summary from tool call arguments for logging."""
     if not args_str:
         return ""
     try:
         args = json.loads(args_str)
     except (json.JSONDecodeError, TypeError):
-        # apply_patch 等工具参数可能不是 JSON
-        # 尝试提取文件路径
-        if "---" in args_str and "+++" in args_str:
-            for line in args_str.splitlines():
-                if line.startswith("+++ "):
-                    path = line[4:].strip()
-                    if path.startswith("b/"):
-                        path = path[2:]
-                    return path[:120]
-        return args_str[:80].replace("\n", " ").strip()
+        return args_str[:120].replace("\n", " ").strip()
 
-    if isinstance(args, dict):
-        if name == "bash":
-            cmd = args.get("command", "")
-            if not cmd:
-                return ""
-            # 对短命令（<= 200 字符）完整显示（将换行替换为 ; ）
-            if len(cmd) <= 200:
-                return cmd.replace("\n", " ; ").strip()[:200]
-            # 较长命令：显示前 3 行，用 ; 连接
-            lines = [l.strip() for l in cmd.split("\n") if l.strip()]
-            preview = " ; ".join(lines[:3])
-            if len(lines) > 3:
-                preview += " ..."
-            return preview[:200]
-        elif name == "read":
-            return args.get("filePath", "") or args.get("file_path", "")
-        elif name in ("write", "edit"):
-            return args.get("filePath", "") or args.get("file_path", "")
-        elif name in ("glob", "Glob"):
-            return args.get("pattern", "") or str(args)[:80]
-        elif name in ("grep", "Grep"):
-            pat = args.get("pattern", "")
-            path = args.get("path", "")
-            if pat and path:
-                return f"{pat} in {path}"
-            return pat or str(args)[:80]
-        elif name == "apply_patch":
-            patch = (args.get("patch", "") or args.get("patchText", "")
-                     or args.get("diff", "") or str(args))
-            # 提取所有被修改的文件路径
-            files = []
-            for pline in patch.splitlines():
-                if pline.startswith("+++ "):
-                    path = pline[4:].strip()
-                    if path.startswith("b/"):
-                        path = path[2:]
-                    files.append(path)
-                # OpenCode *** Add File / *** Update File 格式
-                elif pline.startswith("*** Add File: "):
-                    files.append(pline[14:].strip())
-                elif pline.startswith("*** Update File: "):
-                    files.append(pline[17:].strip())
-            if files:
-                return ", ".join(f[:80] for f in files[:3])
-            # Fallback: 显示 patch 内容摘要
-            return patch[:100].replace("\n", " ").strip()
-        elif name == "todowrite":
-            todos = args.get("todos", [])
-            if isinstance(todos, list) and todos:
-                first = todos[0]
-                if isinstance(first, dict):
-                    return first.get("content", "")[:100]
-            return ""
-        else:
-            # 通用 fallback: 返回第一个有意义的字符串值
-            for v in args.values():
-                if isinstance(v, str) and v.strip() and len(v) < 200:
-                    return v.strip()[:100]
-            return ""
+    if not isinstance(args, dict):
+        return ""
+
+    # Tool-specific key extraction
+    if name == "bash":
+        cmd = args.get("command", "")
+        return cmd.replace("\n", " ; ").strip()[:200] if cmd else ""
+    if name in ("read", "write", "edit"):
+        return args.get("filePath", "") or args.get("file_path", "")
+    if name in ("glob", "Glob"):
+        return args.get("pattern", "")
+    if name in ("grep", "Grep"):
+        pat, path = args.get("pattern", ""), args.get("path", "")
+        return f"{pat} in {path}" if pat and path else pat
+
+    # Generic fallback: first short string value
+    for v in args.values():
+        if isinstance(v, str) and v.strip() and len(v) < 200:
+            return v.strip()[:120]
     return ""
 
 
@@ -310,11 +187,6 @@ def _strip_encrypted(obj: dict | list, _depth: int = 0) -> bool:
         if "encrypted_content" in obj:
             del obj["encrypted_content"]
             changed = True
-        # Also strip reasoning items that only carry encrypted content
-        # from Responses API "input" arrays.
-        if obj.get("type") == "reasoning" and "encrypted_content" not in obj:
-            # Already stripped above; mark for removal from parent list
-            pass
         for v in obj.values():
             if isinstance(v, (dict, list)):
                 changed |= _strip_encrypted(v, _depth + 1)
@@ -348,12 +220,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
 
         # Build upstream request
         url = f"{_upstream}{self.path}"
-        headers = {}
-        for key in ("Content-Type", "Authorization", "Accept"):
+        headers = {"Content-Type": self.headers.get("Content-Type", "application/json")}
+        for key in ("Authorization", "Accept"):
             val = self.headers.get(key)
             if val:
                 headers[key] = val
-        headers["Content-Type"] = self.headers.get("Content-Type", "application/json")
 
         # Check if request asks for streaming
         is_stream = False
@@ -374,12 +245,15 @@ class ProxyHandler(BaseHTTPRequestHandler):
         try:
             resp = urlopen(req, timeout=_upstream_timeout)
         except HTTPError as e:
-            self.send_response(e.code)
-            for k, v in e.headers.items():
-                if k.lower() not in ("transfer-encoding", "connection"):
-                    self.send_header(k, v)
-            self.end_headers()
-            self.wfile.write(e.read())
+            try:
+                self.send_response(e.code)
+                for k, v in e.headers.items():
+                    if k.lower() not in ("transfer-encoding", "connection"):
+                        self.send_header(k, v)
+                self.end_headers()
+                self.wfile.write(e.read())
+            finally:
+                e.close()
             return
         except Exception as e:
             self.send_response(502)
@@ -395,8 +269,11 @@ class ProxyHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
         if not is_stream:
-            data = resp.read()
-            self.wfile.write(data)
+            try:
+                data = resp.read()
+                self.wfile.write(data)
+            finally:
+                resp.close()
             return
 
         # Streaming: read SSE chunks, log tokens, forward to client.
@@ -424,6 +301,10 @@ class ProxyHandler(BaseHTTPRequestHandler):
                 line_q.put(exc)
             finally:
                 line_q.put(_SENTINEL)
+                try:
+                    resp.close()
+                except Exception:
+                    pass
 
         reader_t = threading.Thread(target=_reader, daemon=True)
         reader_t.start()
@@ -502,16 +383,22 @@ class ProxyHandler(BaseHTTPRequestHandler):
         req = Request(url, headers=headers, method="GET")
         try:
             resp = urlopen(req, timeout=30)
-            self.send_response(resp.status)
-            for k, v in resp.headers.items():
-                if k.lower() not in ("transfer-encoding", "connection"):
-                    self.send_header(k, v)
-            self.end_headers()
-            self.wfile.write(resp.read())
+            try:
+                self.send_response(resp.status)
+                for k, v in resp.headers.items():
+                    if k.lower() not in ("transfer-encoding", "connection"):
+                        self.send_header(k, v)
+                self.end_headers()
+                self.wfile.write(resp.read())
+            finally:
+                resp.close()
         except HTTPError as e:
-            self.send_response(e.code)
-            self.end_headers()
-            self.wfile.write(e.read())
+            try:
+                self.send_response(e.code)
+                self.end_headers()
+                self.wfile.write(e.read())
+            finally:
+                e.close()
         except Exception as e:
             self.send_response(502)
             self.end_headers()

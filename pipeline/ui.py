@@ -1,7 +1,7 @@
 """Rich-based terminal UI for pipeline output.
 
 Provides a shared Console and formatting helpers used across
-runner.py, phases.py, stream.py, and client.py.
+runner.py, phases.py, and client.py.
 """
 
 from __future__ import annotations
@@ -21,20 +21,26 @@ console = Console(highlight=False)
 # ---------------------------------------------------------------------------
 # Colour / style tokens (centralised so every module is consistent)
 # ---------------------------------------------------------------------------
-STYLE_HEADER = "bold bright_white"
 STYLE_SUBHEADER = "bold cyan"
 STYLE_KEY = "dim"
 STYLE_VALUE = "bright_white"
 STYLE_SUCCESS = "bold green"
-STYLE_WARNING = "bold yellow"
-STYLE_ERROR = "bold red"
 STYLE_DIM = "dim"
 STYLE_TOOL = "bold cyan"
-STYLE_TOOL_DETAIL = "cyan"
-STYLE_THINKING = "dim italic"
 STYLE_AGENT = "bright_magenta"
-STYLE_SCORE = "bold bright_green"
 STYLE_PHASE_LABEL = "bold bright_blue"
+
+
+# ---------------------------------------------------------------------------
+# Shared KV table constructor
+# ---------------------------------------------------------------------------
+def _make_kv_table(key_min_width: int = 18, padding: tuple[int, int] = (0, 2),
+                   value_style: str = STYLE_VALUE) -> Table:
+    """Create a key-value table with consistent styling."""
+    tbl = Table(show_header=False, box=None, padding=padding, show_edge=False)
+    tbl.add_column("Key", style=STYLE_KEY, min_width=key_min_width)
+    tbl.add_column("Value", style=value_style)
+    return tbl
 
 
 # ---------------------------------------------------------------------------
@@ -48,10 +54,7 @@ def print_pipeline_header(task: str, base_model: str, workspace: str,
     """Print the main pipeline banner with config table."""
     title = Text("OpenCode RL Pipeline", style="bold bright_white")
 
-    tbl = Table(show_header=False, box=None, padding=(0, 2),
-                show_edge=False)
-    tbl.add_column("Key", style=STYLE_KEY, min_width=18)
-    tbl.add_column("Value", style=STYLE_VALUE)
+    tbl = _make_kv_table()
 
     tbl.add_row("Task", task)
     tbl.add_row("Base Model", base_model)
@@ -76,14 +79,11 @@ def print_data_gpu_info(data_count: int, gpu_count: int, gpu_name: str):
 
 def print_pipeline_footer(best_score, best_iteration, total_iters, total_time):
     """Print the final summary panel."""
-    tbl = Table(show_header=False, box=None, padding=(0, 2),
-                show_edge=False)
-    tbl.add_column("Key", style=STYLE_KEY, min_width=16)
-    tbl.add_column("Value", style=STYLE_VALUE)
+    tbl = _make_kv_table(key_min_width=16)
 
     score_str = f"{best_score}" if best_score is not None else "N/A"
     tbl.add_row("Best Score", f"[bold bright_green]{score_str}[/]")
-    tbl.add_row("Best Iteration", str(best_iteration) if best_iteration else "N/A")
+    tbl.add_row("Best Iteration", str(best_iteration) if best_iteration is not None and best_iteration >= 0 else "N/A")
     tbl.add_row("Total Iterations", str(total_iters))
     tbl.add_row("Total Time", f"{total_time:.0f}s")
 
@@ -110,10 +110,7 @@ def print_iteration_header(iteration: int, max_iterations: int, elapsed: float):
 def print_iteration_summary(iteration, score, improvement,
                             best_score, best_iteration, elapsed):
     """Print compact iteration summary."""
-    tbl = Table(show_header=False, box=None, padding=(0, 1),
-                show_edge=False)
-    tbl.add_column("Key", style=STYLE_KEY, min_width=18)
-    tbl.add_column("Value")
+    tbl = _make_kv_table(padding=(0, 1), value_style="")
 
     s = f"[bright_green]{score}[/]" if score is not None else "[dim]N/A[/]"
     imp = f"{improvement}" if improvement is not None else "N/A"
@@ -142,23 +139,12 @@ def print_phase_header(phase_name: str, subtitle: str = ""):
     console.print(Rule(label, style="blue"))
 
 
-def print_phase_status(msg: str, style: str = ""):
-    """Print a phase status line (indented)."""
-    if style:
-        console.print(f"  [{style}]{msg}[/]")
-    else:
-        console.print(f"  {msg}")
-
-
 # ---------------------------------------------------------------------------
 # Evaluation report
 # ---------------------------------------------------------------------------
 def print_evaluation_report(score, improvement, best_score, submission_id=None):
     """Print evaluation results panel."""
-    tbl = Table(show_header=False, box=None, padding=(0, 2),
-                show_edge=False)
-    tbl.add_column("Key", style=STYLE_KEY, min_width=20)
-    tbl.add_column("Value")
+    tbl = _make_kv_table(key_min_width=20, value_style="")
 
     tbl.add_row("Source", "[green]Grading Server[/]")
     tbl.add_row("Score",
@@ -177,35 +163,7 @@ def print_evaluation_report(score, improvement, best_score, submission_id=None):
 
 
 # ---------------------------------------------------------------------------
-# Agent monitor lines (used by client.py _tail_token_log)
-# ---------------------------------------------------------------------------
-def print_agent_thinking(elapsed: float):
-    """LLM is generating tokens (no tool call)."""
-    console.print(f"    [{STYLE_THINKING}]... LLM thinking ({elapsed:.0f}s)[/]")
-
-
-def print_agent_tool_call(tool_name: str, elapsed: float):
-    """Agent started a server-side tool call (from [TOOL] event)."""
-    console.print(f"    [{STYLE_TOOL}]... agent calling: {tool_name} ({elapsed:.0f}s)[/]")
-
-
-def print_agent_tool_detail(detail: str):
-    """Tool call completed with detail info (from [TOOL_DETAIL] event)."""
-    # Truncate very long details
-    if len(detail) > 120:
-        detail = detail[:117] + "..."
-    console.print(f"    [{STYLE_TOOL_DETAIL}]    {detail}[/]")
-
-
-def print_agent_token_line(text: str):
-    """A line of streamed token content."""
-    if len(text) > 200:
-        text = text[:197] + "..."
-    console.print(f"    [dim]| {text}[/]")
-
-
-# ---------------------------------------------------------------------------
-# Stream printer (Turn-level output used by stream.py)
+# Stream printer (Turn-level output helpers)
 # ---------------------------------------------------------------------------
 def print_turn_header(label: str, turn: int, elapsed: float):
     """Print a turn header for agent interaction."""
@@ -242,3 +200,75 @@ def print_tool_result(text: str, ok: bool = True):
     """Print a tool call result."""
     style = "green" if ok else "red"
     console.print(f"    [{style}]< {text}[/]")
+
+
+# ---------------------------------------------------------------------------
+# Stream printer (on_turn callback for agent phases)
+# ---------------------------------------------------------------------------
+def make_stream_printer(label: str):
+    """Return an on_turn callback that prints agent turns in real-time."""
+    start = time.time()
+    last_turn = [0]
+    print_turn_waiting(label)
+
+    def _print(event):
+        elapsed = time.time() - start
+
+        if event.finished:
+            print_turn_done(label, event.turn, elapsed)
+            return
+
+        if event.turn != last_turn[0]:
+            last_turn[0] = event.turn
+            print_turn_header(label, event.turn, elapsed)
+
+        if event.assistant_text:
+            lines = [l.strip() for l in event.assistant_text.strip().splitlines() if l.strip()]
+            for line in lines:
+                if not line.startswith("<") and not line.startswith("```"):
+                    print_agent_thought(line[:200])
+                    break
+
+        results = list(event.results) if event.results else []
+        for i, call in enumerate(event.calls or []):
+            result = results[i] if i < len(results) else None
+            payload = call.payload if isinstance(call.payload, dict) else {}
+
+            if call.kind == "bash":
+                cmd = str(payload.get("command", ""))
+                if len(cmd) > 150:
+                    cmd = cmd[:147] + "..."
+                print_tool_call("bash", cmd)
+                if result:
+                    rc = result.detail.get("rc", "?")
+                    stdout = str(result.detail.get("stdout") or "").strip()
+                    stderr = str(result.detail.get("stderr") or "").strip()
+                    if result.ok:
+                        out = stdout[:200].replace("\n", " | ") if stdout else ""
+                        print_tool_result(f"(rc={rc}) {out}", ok=True)
+                    else:
+                        err = stderr[:200].replace("\n", " | ") if stderr else stdout[:200].replace("\n", " | ")
+                        print_tool_result(f"(rc={rc}) {err}", ok=False)
+
+            elif call.kind == "file":
+                file_path = str(payload.get("filePath", ""))
+                if result is None:
+                    print_tool_call("file", file_path)
+                    continue
+                kind = result.kind
+                ok_str = "ok" if result.ok else str(result.detail.get("error", "failed"))
+                if kind == "read":
+                    print_tool_call("read", file_path)
+                    content = str(result.detail.get("content") or "")
+                    print_tool_result(f"ok ({len(content)} chars)" if result.ok else ok_str, ok=result.ok)
+                elif kind in ("write", "edit"):
+                    print_tool_call(kind, file_path)
+                    if result.ok:
+                        print_tool_result(f"ok ({result.detail.get('bytes', 0)} bytes, {result.detail.get('mode', kind)})", ok=True)
+                    else:
+                        print_tool_result(ok_str, ok=False)
+                else:
+                    print_tool_call(kind, file_path)
+                    print_tool_result(ok_str, ok=result.ok)
+
+    return _print

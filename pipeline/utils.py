@@ -1,6 +1,5 @@
 """Pipeline 工具函数：数据统计、GPU 信息、模型解析。"""
 
-import json
 import os
 import subprocess
 from pathlib import Path
@@ -48,38 +47,19 @@ def resolve_model_path(model_name: str) -> str:
 
 
 def get_data_stats(data_path: str) -> dict:
-    """读取 train.jsonl，返回样本数和长度统计。"""
-    samples = []
+    """Count lines in train.jsonl without loading the whole file into memory."""
     path = Path(data_path)
     jsonl = path / "train.jsonl" if path.is_dir() else path
 
     if not jsonl.exists():
-        return {"count": 0, "avg_prompt_len": 0, "avg_answer_len": 0}
+        return {"count": 0}
 
     try:
         with open(jsonl, "r", encoding="utf-8") as f:
-            for line in f:
-                if line.strip():
-                    samples.append(json.loads(line))
+            count = sum(1 for line in f if line.strip())
+        return {"count": count}
     except Exception:
-        return {"count": 0, "avg_prompt_len": 0, "avg_answer_len": 0}
-
-    if not samples:
-        return {"count": 0, "avg_prompt_len": 0, "avg_answer_len": 0}
-
-    prompt_lens = []
-    answer_lens = []
-    for s in samples:
-        prompt = s.get("prompt") or s.get("question") or s.get("instruction") or ""
-        answer = s.get("answer") or s.get("response") or s.get("output") or ""
-        prompt_lens.append(len(prompt))
-        answer_lens.append(len(answer))
-
-    return {
-        "count": len(samples),
-        "avg_prompt_len": sum(prompt_lens) // max(len(prompt_lens), 1),
-        "avg_answer_len": sum(answer_lens) // max(len(answer_lens), 1),
-    }
+        return {"count": 0}
 
 
 def get_gpu_info() -> dict:
@@ -103,7 +83,7 @@ def get_gpu_info() -> dict:
 
     # 如果设置了 CUDA_VISIBLE_DEVICES，以它为准；否则取 nvidia-smi 的数量
     if cuda_devices:
-        num_gpus = len(cuda_devices.split(","))
+        num_gpus = len([d for d in cuda_devices.split(",") if d.strip()])
     else:
         num_gpus = nvidia_gpu_count
 

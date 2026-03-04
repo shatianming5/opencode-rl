@@ -7,6 +7,7 @@
 
 import json
 import os
+import tempfile
 import time
 from pathlib import Path
 
@@ -17,7 +18,6 @@ from .phases import (
     phase_fix_training,
     phase_training,
 )
-from .state import load_checkpoint, save_checkpoint
 from .types import (
     IterationResult,
     IterationState,
@@ -31,43 +31,32 @@ from .ui import (
     print_evaluation_report,
     print_iteration_header,
     print_iteration_summary,
-    print_phase_header,
-    print_phase_status,
     print_pipeline_footer,
     print_pipeline_header,
 )
 from .utils import get_data_stats, get_gpu_info
 
 
-# ---------------------------------------------------------------------------
-# 常量
-# ---------------------------------------------------------------------------
-_LOG_TRUNCATE = 20000
-_ERR_TRUNCATE = 4000
+def _to_iteration_result(it: IterationState) -> IterationResult:
+    """Convert an IterationState to an IterationResult."""
+    return IterationResult(
+        iteration=it.iteration,
+        exit_code=it.exit_code,
+        training_time=it.training_time,
+        score=it.score,
+        model_path=it.model_path,
+        code_path=it.code_path,
+        analysis=it.analysis,
+        improvement=it.improvement,
+    )
 
 
-# ---------------------------------------------------------------------------
-# 共享工具函数
-# ---------------------------------------------------------------------------
-def _normalize_score(raw) -> float | None:
-    """将 [0,1] 的原始分数归一化为 [0,100] 百分制。"""
-    if raw is None or not isinstance(raw, (int, float)):
-        return None
-    return round(raw * 100, 2) if raw <= 1.05 else raw
-
-
-def _find_trained_model(output_dir: str) -> str:
-    """在 output_dir 下找到最新的模型子目录。"""
-    out_path = Path(output_dir)
-    if not out_path.exists():
-        return str(out_path)
+def _write_training_log(path: str, stdout: str) -> None:
+    """Write training stdout to log file, warn on failure."""
     try:
-        subdirs = [d for d in out_path.iterdir() if d.is_dir() and not d.name.startswith(".")]
-    except OSError:
-        return str(out_path)
-    if subdirs:
-        return str(max(subdirs, key=lambda d: d.stat().st_mtime))
-    return str(out_path)
+        Path(path).write_text(stdout, encoding="utf-8")
+    except OSError as e:
+        console.print(f"  [bold yellow]WARNING:[/] Failed to write training log: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -139,11 +128,7 @@ def _run_phase_training(
     )
 
     training_log_path = str(Path(workspace) / "code" / "training_stdout.log")
-    stdout = train_result.payload.get("stdout", "")
-    try:
-        Path(training_log_path).write_text(stdout, encoding="utf-8")
-    except OSError as e:
-        console.print(f"  [bold yellow]WARNING:[/] Failed to write training log: {e}")
+    _write_training_log(training_log_path, train_result.payload.get("stdout", ""))
 
     total_time = train_result.payload.get("elapsed", 0.0)
 
@@ -171,15 +156,10 @@ def _run_phase_training(
         )
         extra_time = train_result.payload.get("elapsed", 0.0)
         total_time += extra_time
-        stdout = train_result.payload.get("stdout", "")
-        try:
-            Path(training_log_path).write_text(stdout, encoding="utf-8")
-        except OSError as e:
-            console.print(f"  [bold yellow]WARNING:[/] Failed to write training log: {e}")
+        _write_training_log(training_log_path, train_result.payload.get("stdout", ""))
 
     exit_code = train_result.payload.get("exit_code", -1)
     iter_state.exit_code = exit_code
-    iter_state.stdout = train_result.payload.get("stdout", "")
     iter_state.training_time = total_time
 
     return PhaseResult(
@@ -200,7 +180,6 @@ def _run_phase_evaluation(
     """EVALUATION 阶段：提交模型到 Grading Server。"""
     grading_url = os.environ.get("GRADING_SERVER_URL", "http://localhost:5000")
     result = phase_evaluation(
-        workspace=state.workspace,
         grading_url=grading_url,
         output_dir=state.output_dir,
         timeout=state.eval_timeout,
@@ -280,7 +259,6 @@ def run_pipeline(
     training_timeout: int = 3600,
     max_agent_steps: int = 25,
     max_retries: int = 3,
-    fsm_config: dict | None = None,
     resume: bool = False,
     stale_timeout: int = 180,
     http_timeout: int = 300,
@@ -295,7 +273,6 @@ def run_pipeline(
         CODE_GEN → TRAINING → EVALUATION → ANALYSIS → COMPLETE
     """
     pipeline_start = time.time()
-    fsm_config = fsm_config or {}
 
     if not data_path:
         data_path = os.environ.get("DATA_PATH", "")
@@ -326,7 +303,6 @@ def run_pipeline(
             max_agent_steps=max_agent_steps,
             max_retries=max_retries,
             eval_timeout=eval_timeout,
-            pipeline_start_time=pipeline_start,
         )
 
     print_pipeline_header(
@@ -355,16 +331,7 @@ def run_pipeline(
     history: list[IterationResult] = []
     for it in state.iterations:
         if it.current_phase == Phase.COMPLETE.value:
-            history.append(IterationResult(
-                iteration=it.iteration,
-                exit_code=it.exit_code,
-                training_time=it.training_time,
-                score=it.score,
-                model_path=it.model_path,
-                code_path=it.code_path,
-                analysis=it.analysis,
-                improvement=it.improvement,
-            ))
+            history.append(_to_iteration_result(it))
 
     # ----- 确定起始迭代 -----
     start_iteration = state.current_iteration + 1 if state.current_iteration > 0 else 1
@@ -473,7 +440,7 @@ def run_pipeline(
                     if not result.success:
                         console.print(f"  [red]Evaluation failed:[/] {result.error}")
                     else:
-                        print_phase_status("No score available", "dim")
+                        console.print("  [dim]No score available[/]")
 
                 state.best_score = best_score
                 state.best_iteration = best_iteration
@@ -490,21 +457,10 @@ def run_pipeline(
                     save_checkpoint(state)
 
             elif phase == Phase.COMPLETE:
-                iter_state.current_phase = Phase.COMPLETE.value
                 save_checkpoint(state)
 
         # ---- 迭代结束 ----
-        # 追加到 history
-        history.append(IterationResult(
-            iteration=iter_state.iteration,
-            exit_code=iter_state.exit_code,
-            training_time=iter_state.training_time,
-            score=iter_state.score,
-            model_path=iter_state.model_path,
-            code_path=iter_state.code_path,
-            analysis=iter_state.analysis,
-            improvement=iter_state.improvement,
-        ))
+        history.append(_to_iteration_result(iter_state))
 
         iter_elapsed = time.time() - iter_start
         print_iteration_summary(
@@ -541,3 +497,45 @@ def run_pipeline(
     summary_path = Path(workspace) / "pipeline_results.json"
     summary_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False))
     console.print(f"  [dim]Results saved:[/] {summary_path}")
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint persistence (atomic write / load)
+# ---------------------------------------------------------------------------
+_CHECKPOINT_NAME = "checkpoint.json"
+
+
+def save_checkpoint(state: PipelineState) -> None:
+    """Atomic write of checkpoint.json."""
+    path = Path(state.workspace) / _CHECKPOINT_NAME
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data = json.dumps(state.to_dict(), indent=2, ensure_ascii=False)
+    fd, tmp_path = tempfile.mkstemp(
+        dir=str(path.parent), prefix=".checkpoint_", suffix=".tmp",
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(data)
+        os.replace(tmp_path, str(path))
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+    console.print(f"  [dim]\\[checkpoint] Saved: iter={state.current_iteration}, phases={len(state.iterations)}[/]")
+
+
+def load_checkpoint(workspace: str) -> PipelineState | None:
+    """Load checkpoint.json, return PipelineState or None."""
+    path = Path(workspace) / _CHECKPOINT_NAME
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        state = PipelineState.from_dict(data)
+        console.print(f"  [dim]\\[checkpoint] Loaded: iter={state.current_iteration}, phases={len(state.iterations)}[/]")
+        return state
+    except Exception as e:
+        console.print(f"  [bold yellow]WARNING:[/] Failed to load {path}: {e}")
+        return None

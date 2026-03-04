@@ -67,7 +67,6 @@ class IterationState:
     current_phase: str = Phase.CODE_GEN.value
     score: float | None = None
     exit_code: int = -1
-    stdout: str = ""
     training_time: float = 0.0
     model_path: str = ""
     code_path: str = ""
@@ -101,7 +100,6 @@ class IterationState:
             d["best_score"] = self.best_score
         if self.submission_id is not None:
             d["submission_id"] = self.submission_id
-        # 注意：stdout 不序列化（可达几十 MB），已单独保存为 training_stdout.log
         return d
 
     @classmethod
@@ -144,8 +142,6 @@ class PipelineState:
     current_iteration: int = 0
     best_score: float | None = None
     best_iteration: int = -1
-    pipeline_start_time: float = 0.0
-
     # 迭代历史
     iterations: list[IterationState] = field(default_factory=list)
 
@@ -198,7 +194,6 @@ class IterationResult:
     """一轮迭代的完整结果（向后兼容接口）。"""
     iteration: int
     exit_code: int = -1
-    stdout: str = ""
     training_time: float = 0.0
     score: float | None = None
     model_path: str = ""

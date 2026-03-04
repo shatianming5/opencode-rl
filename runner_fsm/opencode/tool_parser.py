@@ -6,22 +6,16 @@ import re
 from dataclasses import dataclass
 from typing import Any, Iterable
 
-_FENCE_RE = re.compile(r"```(?P<lang>[a-zA-Z0-9_-]+)?\n(?P<body>.*?)\n```", re.DOTALL)
-_TOOL_CALL_RE = re.compile(r"<tool_call>(?P<body>.*?)</tool_call>", re.DOTALL | re.IGNORECASE)
-_TAG_RE = re.compile(r"<(?P<tag>bash|read|edit)>(?P<body>.*?)</(?P=tag)>", re.DOTALL | re.IGNORECASE)
 _ATTR_TAG_START_RE = re.compile(r"<(?P<tag>bash|read|write|edit)\b", re.IGNORECASE)
 _ATTR_NAME_RE = re.compile(r"[a-zA-Z_][a-zA-Z0-9_-]*")
-_INLINE_TOOL_JSON_RE = re.compile(
-    r"(?<![A-Za-z0-9_])(?P<tag>bash|read|write|edit)\s*(?P<json>\{)",
-    re.IGNORECASE,
-)
+_TOOL_CALL_RE = re.compile(r"<tool_call>(?P<body>.*?)</tool_call>", re.DOTALL | re.IGNORECASE)
 
 
 @dataclass(frozen=True)
 class ToolCall:
     kind: str  # bash | file
     start: int
-    payload: dict[str, Any] | str
+    payload: dict[str, Any]
 
 
 @dataclass(frozen=True)
@@ -152,107 +146,6 @@ def _extract_attr_loose(attrs_raw: str, key: str) -> str | None:
     return None
 
 
-def _repair_json_escapes(s: str) -> str:
-    """Fix invalid JSON escape sequences inside double-quoted strings."""
-    valid_next = {'"', "\\", "/", "b", "f", "n", "r", "t", "u"}
-    out: list[str] = []
-    in_string = False
-    escaped = False
-    i = 0
-    while i < len(s):
-        ch = s[i]
-        if not in_string:
-            out.append(ch)
-            if ch == '"':
-                in_string = True
-            i += 1
-            continue
-        if escaped:
-            out.append(ch)
-            escaped = False
-            i += 1
-            continue
-        if ch == "\\":
-            if i + 1 >= len(s):
-                out.append("\\\\")
-                i += 1
-                continue
-            nxt = s[i + 1]
-            if nxt in valid_next:
-                out.append("\\")
-                escaped = True
-                i += 1
-                continue
-            out.append("\\\\")
-            i += 1
-            continue
-        out.append(ch)
-        if ch == '"':
-            in_string = False
-        i += 1
-    return "".join(out)
-
-
-def _repair_json_keys(s: str) -> str:
-    """Fix missing opening quotes on JSON keys."""
-    return re.sub(r'([,{]\s*)([A-Za-z_][A-Za-z0-9_-]*)"\s*:', r'\1"\2":', s)
-
-
-def _try_json(text: str) -> dict[str, Any] | None:
-    s = text.strip()
-    if not s:
-        return None
-    try:
-        data = json.loads(s)
-    except Exception:
-        for repair_fn in (
-            lambda t: _repair_json_escapes(t),
-            lambda t: _repair_json_keys(t),
-            lambda t: _repair_json_escapes(_repair_json_keys(t)),
-        ):
-            repaired = repair_fn(s)
-            if repaired != s:
-                try:
-                    data = json.loads(repaired)
-                    return data if isinstance(data, dict) else None
-                except Exception:
-                    continue
-        return None
-    return data if isinstance(data, dict) else None
-
-
-def _extract_json_object(text: str, start: int) -> tuple[str, int] | None:
-    """Extract a balanced JSON object from `text[start:]` where `text[start] == '{'`."""
-    if start < 0 or start >= len(text) or text[start] != "{":
-        return None
-    depth = 0
-    in_string = False
-    escaped = False
-    for idx in range(start, len(text)):
-        ch = text[idx]
-        if in_string:
-            if escaped:
-                escaped = False
-                continue
-            if ch == "\\":
-                escaped = True
-                continue
-            if ch == '"':
-                in_string = False
-            continue
-        if ch == '"':
-            in_string = True
-            continue
-        if ch == "{":
-            depth += 1
-            continue
-        if ch == "}":
-            depth -= 1
-            if depth == 0:
-                return text[start : idx + 1], idx + 1
-    return None
-
-
 def _find_tag_gt(text: str, start: int) -> int:
     """Find the end of an XML-like opening tag, respecting quoted attrs."""
     i = start
@@ -377,87 +270,36 @@ def parse_tool_calls(text: str) -> list[ToolCall]:
                 payload2["newString"] = attrs["newString"].replace("\\n", "\n")
             calls.append(ToolCall(kind="file", start=start, payload=payload2))
 
+    # Fallback: <tool_call>{JSON}</tool_call> format (some models)
     for m in _TOOL_CALL_RE.finditer(text):
-        inner = m.group("body") or ""
-        for tm in _TAG_RE.finditer(inner):
-            tag = (tm.group("tag") or "").strip().lower()
-            body = (tm.group("body") or "").strip()
-            data = _try_json(body)
-            if not data:
-                continue
-            if tag == "bash" and isinstance(data.get("command"), str):
-                calls.append(ToolCall(kind="bash", start=m.start(), payload=data))
-            if tag in ("read", "edit") and isinstance(data.get("filePath"), str):
-                calls.append(ToolCall(kind="file", start=m.start(), payload=data))
-
-        data2 = _try_json(inner)
-        if data2:
-            raw_name = data2.get("name") or data2.get("tool") or data2.get("toolName")
-            raw_args = data2.get("arguments") or data2.get("args")
-            if isinstance(raw_name, str) and isinstance(raw_args, dict):
-                name = raw_name.strip().lower()
-                args = raw_args
-                if name == "bash" and isinstance(args.get("command"), str):
-                    calls.append(ToolCall(kind="bash", start=m.start(), payload=args))
-                if name in ("read", "write", "edit") and isinstance(args.get("filePath"), str):
-                    calls.append(ToolCall(kind="file", start=m.start(), payload=args))
-            else:
-                if isinstance(data2.get("command"), str):
-                    calls.append(ToolCall(kind="bash", start=m.start(), payload=data2))
-                if isinstance(data2.get("filePath"), str):
-                    calls.append(ToolCall(kind="file", start=m.start(), payload=data2))
-
-    for m in _FENCE_RE.finditer(text):
-        lang = (m.group("lang") or "").strip().lower()
-        body = (m.group("body") or "").strip()
-
-        if lang == "json":
-            data = _try_json(body)
-            if data and isinstance(data.get("filePath"), str):
-                calls.append(ToolCall(kind="file", start=m.start(), payload=data))
+        inner = (m.group("body") or "").strip()
+        if not inner:
             continue
-
-        if lang == "bash":
-            lines = body.splitlines()
-            if not lines:
-                continue
-            if lines[0].strip().lower() != "bash":
-                continue
-            data = _try_json("\n".join(lines[1:]))
-            if data and isinstance(data.get("command"), str):
-                calls.append(ToolCall(kind="bash", start=m.start(), payload=data))
+        try:
+            data = json.loads(inner)
+        except (json.JSONDecodeError, TypeError):
             continue
-
-    for m in _INLINE_TOOL_JSON_RE.finditer(text):
-        tag = (m.group("tag") or "").strip().lower()
-        json_start = int(m.start("json"))
-        extracted = _extract_json_object(text, json_start)
-        if not extracted:
+        if not isinstance(data, dict):
             continue
-        raw_json, _ = extracted
-        data = _try_json(raw_json)
-        if not data:
-            continue
-        if tag == "bash" and isinstance(data.get("command"), str):
+        # Direct {command:...} or {filePath:...}
+        if isinstance(data.get("command"), str):
             calls.append(ToolCall(kind="bash", start=m.start(), payload=data))
-        if tag in ("read", "write", "edit") and isinstance(data.get("filePath"), str):
+        elif isinstance(data.get("filePath"), str):
             calls.append(ToolCall(kind="file", start=m.start(), payload=data))
+        # Wrapped: {name:"bash", arguments:{...}}
+        raw_name = data.get("name") or data.get("tool")
+        raw_args = data.get("arguments") or data.get("args")
+        if isinstance(raw_name, str) and isinstance(raw_args, dict):
+            name = raw_name.strip().lower()
+            if name == "bash" and isinstance(raw_args.get("command"), str):
+                calls.append(ToolCall(kind="bash", start=m.start(), payload=raw_args))
+            elif name in ("read", "write", "edit") and isinstance(raw_args.get("filePath"), str):
+                calls.append(ToolCall(kind="file", start=m.start(), payload=raw_args))
 
+    # Deduplicate: keep richer payload when same position, unique by content
     calls.sort(key=lambda c: c.start)
-    merged: list[ToolCall] = []
-    for c in calls:
-        if merged and merged[-1].start == c.start and merged[-1].kind == c.kind:
-            prev = merged[-1]
-            prev_size = len(json.dumps(prev.payload, sort_keys=True, ensure_ascii=False))
-            cur_size = len(json.dumps(c.payload, sort_keys=True, ensure_ascii=False))
-            if cur_size >= prev_size:
-                merged[-1] = c
-            continue
-        merged.append(c)
-    calls = merged
-
-    uniq: list[ToolCall] = []
     seen: set[str] = set()
+    uniq: list[ToolCall] = []
     for c in calls:
         key = json.dumps({"kind": c.kind, "payload": c.payload}, sort_keys=True, ensure_ascii=False)
         if key in seen:
@@ -465,14 +307,16 @@ def parse_tool_calls(text: str) -> list[ToolCall]:
         seen.add(key)
         uniq.append(c)
 
+    # Unescape XML entities in string values (rebuild to respect frozen dataclass)
+    result: list[ToolCall] = []
     for c in uniq:
-        if not isinstance(c.payload, dict):
-            continue
+        p = dict(c.payload)
         for k in ("filePath", "content", "oldString", "newString", "command", "description"):
-            v = c.payload.get(k)
+            v = p.get(k)
             if isinstance(v, str) and v:
-                c.payload[k] = _xml_unescape(v)
-    return uniq
+                p[k] = _xml_unescape(v)
+        result.append(ToolCall(kind=c.kind, start=c.start, payload=p))
+    return result
 
 
 def format_tool_results(results: list[ToolResult]) -> str:

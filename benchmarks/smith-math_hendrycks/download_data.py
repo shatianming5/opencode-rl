@@ -1,1 +1,1 @@
-/data/userdata/v-tiansha/RD-Agent/rdagent/scenarios/rl/autorl_bench/benchmarks/smith/math_hendrycks/download_data.py
+/data/userdata/v-tiansha/rl-smith/benchmarks/math_hendrycks/download_data.py

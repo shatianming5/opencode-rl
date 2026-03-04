@@ -132,12 +132,6 @@ def main():
             shutil.copy2(src, dst)
             print(f"  Exposed: {fname}")
 
-    fsm_config = {
-        "target_repo": run_dir,
-        "opencode_url": os.environ.get("OPENCODE_URL", ""),
-        "opencode_model": os.environ.get("OPENCODE_MODEL", ""),
-    }
-
     run_pipeline(
         task=args.benchmark,
         base_model=args.base_model,
@@ -148,7 +142,6 @@ def main():
         training_timeout=args.training_timeout,
         max_agent_steps=args.max_agent_steps,
         max_retries=args.max_retries,
-        fsm_config=fsm_config,
         resume=args.resume,
         stale_timeout=args.stale_timeout,
         http_timeout=args.http_timeout,

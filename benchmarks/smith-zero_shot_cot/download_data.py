@@ -1,1 +1,1 @@
-/data/userdata/v-tiansha/RD-Agent/rdagent/scenarios/rl/autorl_bench/benchmarks/smith/zero_shot_cot/download_data.py
+/data/userdata/v-tiansha/rl-smith/benchmarks/zero_shot_cot/download_data.py

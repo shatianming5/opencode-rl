@@ -1,0 +1,6 @@
+{
+  "uri": "scenarios.finetune.share:scen.assets_path",
+  "template": "./assets/",
+  "context": {},
+  "rendered": "./assets/"
+}

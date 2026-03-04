@@ -1,1 +1,1 @@
-/data/userdata/v-tiansha/RD-Agent/rdagent/scenarios/rl/autorl_bench/benchmarks/smith/pal/eval.py
+/data/userdata/v-tiansha/rl-smith/benchmarks/pal/eval.py

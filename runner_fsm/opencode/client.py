@@ -27,6 +27,29 @@ from ..utils.subprocess import tail
 _active_clients: set = set()
 
 
+def _safe_int(v, default: int) -> int:
+    try:
+        return int(v)
+    except (ValueError, TypeError):
+        return default
+
+
+def _safe_float(v, default: float) -> float:
+    try:
+        return float(v)
+    except (ValueError, TypeError):
+        return default
+
+
+def _rprint(text: str, style: str = "dim") -> None:
+    """Print with rich formatting if available, else plain."""
+    try:
+        from pipeline.ui import console
+        console.print(f"    [{style}]{text}[/]")
+    except Exception:
+        print(f"    {text}", flush=True)
+
+
 def _find_free_port(host: str = "127.0.0.1") -> int:
     """Find a free port with SO_REUSEADDR to reduce TOCTOU race window."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -34,14 +57,6 @@ def _find_free_port(host: str = "127.0.0.1") -> int:
         s.bind((host, 0))
         _, port = s.getsockname()
     return port
-
-def select_bash_mode(*, purpose: str, default_bash_mode: str, scaffold_bash_mode: str) -> str:
-    p = str(purpose or "").strip().lower()
-    default = str(default_bash_mode or "restricted").strip().lower() or "restricted"
-    scaffold = str(scaffold_bash_mode or default).strip().lower() or default
-    if p in ("scaffold_contract", "repair_contract"):
-        return scaffold
-    return default
 
 @dataclass(frozen=True)
 class OpenCodeServerConfig:
@@ -69,8 +84,6 @@ class OpenCodeClient(AgentClient):
         self,
         *,
         repo: Path,
-        plan_rel: str,
-        pipeline_rel: str | None,
         model: str,
         base_url: str | None,
         timeout_seconds: int,
@@ -80,8 +93,6 @@ class OpenCodeClient(AgentClient):
         session_recover_backoff_seconds: float | None = None,
         context_length: int | None = None,
         max_prompt_chars: int | None = None,
-        bash_mode: str,
-        scaffold_bash_mode: str = "full",
         unattended: str,
         max_turns: int = 20,
         server_log_path: Path | None = None,
@@ -93,49 +104,21 @@ class OpenCodeClient(AgentClient):
         permission_overrides: dict[str, Any] | None = None,
     ) -> None:
         self._repo = repo
-        self._plan_rel = str(plan_rel or "PLAN.md").strip() or "PLAN.md"
-        self._pipeline_rel = str(pipeline_rel).strip() if pipeline_rel else None
-        self._timeout_seconds = int(timeout_seconds) if timeout_seconds else 300
+        self._timeout_seconds = int(timeout_seconds or 300)
         self._request_retry_attempts = max(0, int(request_retry_attempts or 0))
-        try:
-            _backoff = float(request_retry_backoff_seconds)
-        except Exception:
-            _backoff = 2.0
-        self._request_retry_backoff_seconds = max(0.0, _backoff)
-        _recover_attempts_raw = (
-            session_recover_attempts
-            if session_recover_attempts is not None
-            else os.environ.get("OPENCODE_SESSION_RECOVER_ATTEMPTS", "2")
-        )
-        try:
-            self._session_recover_attempts = max(0, int(_recover_attempts_raw or 0))
-        except Exception:
-            self._session_recover_attempts = 2
-        _recover_backoff_raw = (
-            session_recover_backoff_seconds
-            if session_recover_backoff_seconds is not None
-            else os.environ.get("OPENCODE_SESSION_RECOVER_BACKOFF_SECONDS", "2.0")
-        )
-        try:
-            self._session_recover_backoff_seconds = max(0.0, float(_recover_backoff_raw or 0.0))
-        except Exception:
-            self._session_recover_backoff_seconds = 2.0
-        try:
-            _context_length = int(context_length or 0)
-        except Exception:
-            _context_length = 0
-        self._context_length: int | None = _context_length if _context_length > 0 else None
-        try:
-            _max_prompt_chars = int(max_prompt_chars or 0)
-        except Exception:
-            _max_prompt_chars = 0
-        self._max_prompt_chars: int | None = _max_prompt_chars if _max_prompt_chars > 0 else None
-        self._bash_mode = (bash_mode or "restricted").strip().lower()
-        if self._bash_mode not in ("restricted", "full"):
-            raise ValueError("invalid_bash_mode")
-        self._scaffold_bash_mode = (scaffold_bash_mode or "full").strip().lower()
-        if self._scaffold_bash_mode not in ("restricted", "full"):
-            raise ValueError("invalid_scaffold_bash_mode")
+        self._request_retry_backoff_seconds = max(0.0, float(request_retry_backoff_seconds or 2.0))
+        self._session_recover_attempts = max(0, _safe_int(
+            session_recover_attempts if session_recover_attempts is not None
+            else os.environ.get("OPENCODE_SESSION_RECOVER_ATTEMPTS", "2"),
+            2,
+        ))
+        self._session_recover_backoff_seconds = max(0.0, _safe_float(
+            session_recover_backoff_seconds if session_recover_backoff_seconds is not None
+            else os.environ.get("OPENCODE_SESSION_RECOVER_BACKOFF_SECONDS", "2.0"),
+            2.0,
+        ))
+        self._context_length = int(context_length or 0) or None
+        self._max_prompt_chars = int(max_prompt_chars or 0) or None
         self._max_turns = max(1, int(max_turns or 20))
         self._unattended = str(unattended or "strict").strip().lower() or "strict"
         self._session_title = str(session_title or f"runner:{repo.name}")
@@ -181,52 +164,16 @@ class OpenCodeClient(AgentClient):
             )
 
         try:
-            deadline = time.time() + 60
-            last_err = ""
-            _health_start = time.time()
-            _health_dots = 0
-            while time.time() < deadline:
-                try:
-                    self._request_json("GET", "/global/health", body=None, require_auth=bool(self._server.password))
-                    elapsed_h = time.time() - _health_start
-                    print(f"    server ready ({elapsed_h:.1f}s)", flush=True)
-                    break
-                except Exception as e:
-                    last_err = str(e)
-                    _health_dots += 1
-                    if _health_dots % 25 == 0:  # 每 5 秒打印一次（0.2s * 25）
-                        elapsed_h = time.time() - _health_start
-                        print(f"    waiting for server... ({elapsed_h:.0f}s)", flush=True)
-                    time.sleep(0.2)
-            else:
-                raise RuntimeError(f"OpenCode server failed health check: {tail(last_err, 2000)}")
-
+            self._wait_health()
             if self._auto_compact is not None:
                 try:
-                    self._request_json(
-                        "PATCH", "/global/config",
-                        body={"compaction": {"auto": bool(self._auto_compact)}},
-                        require_auth=bool(self._server.password),
-                    )
+                    self._request_json("PATCH", "/global/config",
+                                       body={"compaction": {"auto": bool(self._auto_compact)}},
+                                       require_auth=bool(self._server.password))
                 except Exception:
-                    pass  # old server versions may not support this endpoint
-
-            data = self._request_json(
-                "POST",
-                "/session",
-                body={"title": self._session_title},
-                require_auth=bool(self._server.password),
-            )
-            if isinstance(data, dict) and isinstance(data.get("id"), str) and data["id"].strip():
-                self._session_id = data["id"]
-            elif isinstance(data, dict) and isinstance(data.get("sessionID"), str) and data["sessionID"].strip():
-                self._session_id = data["sessionID"]
-            else:
-                raise RuntimeError(
-                    f"unexpected /session response: {tail(json.dumps(data, ensure_ascii=False), 2000)}"
-                )
+                    pass
+            self._create_session()
         except Exception:
-            # If init fails after starting a local server, ensure we don't leak the process.
             try:
                 self.close()
             except Exception:
@@ -236,12 +183,6 @@ class OpenCodeClient(AgentClient):
     def close(self) -> None:
         _active_clients.discard(self)
         self._stop_local_server()
-        if self._server_log_file is not None:
-            try:
-                self._server_log_file.close()
-            except Exception:
-                pass
-            self._server_log_file = None
 
     @staticmethod
     def _extract_context_info(msg: Any) -> dict[str, Any] | None:
@@ -307,115 +248,59 @@ class OpenCodeClient(AgentClient):
 
     def _print_context_status(self, turn: int, ctx_info: dict[str, Any], session_total: int) -> None:
         """Print [context] and [compact] status lines after each turn."""
-        rc = self._LLMWaitMonitor._try_rich()
-        inp = ctx_info.get("input", 0)
-        out = ctx_info.get("output", 0)
-
-        # Format numbers with commas for readability
-        def _fmt(n: int) -> str:
-            return f"{n:,}"
-
-        # Build context line
+        inp, out = ctx_info.get("input", 0), ctx_info.get("output", 0)
         ctx_len = self._context_length
         if ctx_len and ctx_len > 0:
-            pct = (inp / ctx_len * 100) if ctx_len > 0 else 0
-            ctx_line = (
-                f"[context] turn {turn}: {_fmt(inp)}/{_fmt(ctx_len)} ({pct:.0f}%)"
-                f" | out={_fmt(out)} | session={_fmt(session_total)}"
-            )
+            pct = inp / ctx_len * 100
             style = "bold yellow" if pct > 70 else "dim"
+            _rprint(f"\\[context] turn {turn}: {inp:,}/{ctx_len:,} ({pct:.0f}%) | out={out:,} | session={session_total:,}", style)
         else:
-            ctx_line = (
-                f"[context] turn {turn}: in={_fmt(inp)} out={_fmt(out)}"
-                f" | session total={_fmt(session_total)}"
-            )
-            style = "dim"
-
-        if rc:
-            # Escape [ ] so Rich doesn't eat them as markup tags
-            safe = ctx_line.replace("[", "\\[")
-            rc.print(f"    [{style}]{safe}[/]")
-        else:
-            print(f"    {ctx_line}", flush=True)
-
-        # Compaction events
+            _rprint(f"\\[context] turn {turn}: in={inp:,} out={out:,} | session={session_total:,}", "dim")
         if ctx_info.get("compaction"):
-            if rc:
-                rc.print(f"    [bold magenta]\\[compact] auto-compaction triggered[/]")
-            else:
-                print(f"    [compact] auto-compaction triggered", flush=True)
+            _rprint("\\[compact] auto-compaction triggered", "bold magenta")
         if ctx_info.get("summary"):
-            if rc:
-                rc.print(f"    [bold magenta]\\[compact] summary message (post-compaction)[/]")
+            _rprint("\\[compact] summary message (post-compaction)", "bold magenta")
+
+    @staticmethod
+    def _kill_popen(proc: subprocess.Popen | None, timeout: int = 5) -> None:
+        """Terminate a Popen process (SIGTERM → wait → SIGKILL)."""
+        if proc is None or proc.poll() is not None:
+            return
+        try:
+            if os.name == "posix":
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                except Exception:
+                    proc.terminate()
             else:
-                print(f"    [compact] summary message (post-compaction)", flush=True)
+                proc.terminate()
+            proc.wait(timeout=timeout)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
 
     def _stop_local_server(self) -> None:
-        if self._proc is not None:
-            already_dead = self._proc.poll() is not None
-            if not already_dead:
-                try:
-                    # Do not block shutdown on a potentially wedged server.
-                    self._request_json("POST", "/instance/dispose", body=None, require_auth=True, timeout_seconds=5)
-                except Exception:
-                    pass
-                try:
-                    if os.name == "posix":
-                        try:
-                            os.killpg(os.getpgid(self._proc.pid), signal.SIGTERM)
-                        except Exception:
-                            self._proc.terminate()
-                    else:  # pragma: no cover
-                        self._proc.terminate()
-                    try:
-                        self._proc.wait(timeout=5)
-                    except Exception:
-                        if os.name == "posix":
-                            try:
-                                os.killpg(os.getpgid(self._proc.pid), signal.SIGKILL)
-                            except Exception:
-                                self._proc.kill()
-                        else:  # pragma: no cover
-                            self._proc.kill()
-                except Exception:
-                    pass
-            self._proc = None
-        if self._server_log_file is not None:
+        if self._proc is not None and self._proc.poll() is None:
             try:
-                self._server_log_file.close()
+                self._request_json("POST", "/instance/dispose", body=None, require_auth=True, timeout_seconds=5)
             except Exception:
                 pass
-            self._server_log_file = None
-        # Stop LLM proxy
-        if self._proxy_proc is not None:
-            try:
-                if os.name == "posix":
-                    try:
-                        os.killpg(os.getpgid(self._proxy_proc.pid), signal.SIGTERM)
-                    except Exception:
-                        self._proxy_proc.terminate()
-                else:
-                    self._proxy_proc.terminate()
-                self._proxy_proc.wait(timeout=3)
-            except Exception:
+        self._kill_popen(self._proc)
+        self._proc = None
+        self._kill_popen(self._proxy_proc)
+        self._proxy_proc = None
+        for f in (self._server_log_file, self._proxy_log_file):
+            if f is not None:
                 try:
-                    self._proxy_proc.kill()
+                    f.close()
                 except Exception:
                     pass
-            finally:
-                self._proxy_proc = None
-        if self._proxy_log_file is not None:
-            try:
-                self._proxy_log_file.close()
-            except Exception:
-                pass
-            self._proxy_log_file = None
-        # Clean up temp config dir
+        self._server_log_file = None
+        self._proxy_log_file = None
         if self._temp_config_home is not None:
-            try:
-                shutil.rmtree(self._temp_config_home, ignore_errors=True)
-            except Exception:
-                pass
+            shutil.rmtree(self._temp_config_home, ignore_errors=True)
             self._temp_config_home = None
 
     class _LLMWaitMonitor:
@@ -432,8 +317,6 @@ class OpenCodeClient(AgentClient):
             | <<< stream end 523 tokens 4.2s
         """
 
-        _DEFAULT_STALE_TIMEOUT = 180.0
-
         def __init__(self, token_log: Path | None, turn: int,
                      heartbeat_interval: float = 5.0,
                      stale_timeout: float = 180.0,
@@ -445,7 +328,6 @@ class OpenCodeClient(AgentClient):
             self._server_proc = server_proc  # 超时时杀进程触发重试
             self._client_ref = None  # set externally to flag stale timeout on client
             self._stop = threading.Event()
-            self._timed_out = threading.Event()
             self._thread: threading.Thread | None = None
             self._start = 0.0
             self._log_offset = 0
@@ -463,11 +345,7 @@ class OpenCodeClient(AgentClient):
                     self._log_offset = self._token_log.stat().st_size
                 except Exception:
                     self._log_offset = 0
-                try:
-                    from pipeline.ui import console as _rc
-                    _rc.print(f"    [dim italic]... waiting for LLM response (turn {self._turn})[/]")
-                except Exception:
-                    print(f"    ... waiting for LLM response (turn {self._turn})", flush=True)
+                _rprint(f"... waiting for LLM response (turn {self._turn})", "dim italic")
             self._thread = threading.Thread(target=self._run, daemon=True)
             self._thread.start()
 
@@ -485,15 +363,6 @@ class OpenCodeClient(AgentClient):
                 self._print_token_line(text)
                 self._line_buf = ""
 
-        @staticmethod
-        def _try_rich():
-            """Get rich console if available."""
-            try:
-                from pipeline.ui import console as _rc
-                return _rc
-            except Exception:
-                return None
-
         def _estimate_tokens(self) -> int:
             """Best available token estimate: exact (from stream end) or char-based."""
             exact = self._proxy_output_tokens
@@ -501,106 +370,52 @@ class OpenCodeClient(AgentClient):
             return max(exact, estimated)
 
         def _token_suffix(self) -> str:
-            """Build a token/round suffix string for display.
-
-            Three states:
-            - Tokens available: "| ~N tokens / R rounds"
-            - Stream in progress but no visible tokens (reasoning model): "| round R streaming"
-            - No stream activity: ""
-            """
             est = self._estimate_tokens()
             if est > 0:
-                suffix = f" | ~{est:,} tokens"
-                if self._proxy_rounds > 1:
-                    suffix += f" / {self._proxy_rounds} rounds"
-                return suffix
-            # Stream started but no content yet (reasoning model thinking)
+                s = f" | ~{est:,} tokens"
+                return s + f" / {self._proxy_rounds} rounds" if self._proxy_rounds > 1 else s
             if self._proxy_rounds > 0:
-                if self._proxy_rounds > 1:
-                    return f" | round {self._proxy_rounds} streaming"
-                return " | streaming"
+                return f" | round {self._proxy_rounds} streaming" if self._proxy_rounds > 1 else " | streaming"
             return ""
 
         def _print_thinking(self, elapsed: float):
-            rc = self._try_rich()
-            suffix = self._token_suffix()
-            if rc:
-                rc.print(f"    [dim italic]... LLM thinking ({elapsed:.0f}s){suffix}[/]")
-            else:
-                print(f"    ... LLM thinking ({elapsed:.0f}s){suffix}", flush=True)
+            _rprint(f"... LLM thinking ({elapsed:.0f}s){self._token_suffix()}", "dim italic")
 
         def _print_tool_call(self, tool_name: str, elapsed: float):
-            rc = self._try_rich()
-            suffix = self._token_suffix()
-            if rc:
-                rc.print(f"    [bold cyan]... agent calling: {tool_name}[/] [dim]({elapsed:.0f}s){suffix}[/]")
-            else:
-                print(f"    ... agent calling: {tool_name} ({elapsed:.0f}s){suffix}", flush=True)
+            _rprint(f"... agent calling: {tool_name} ({elapsed:.0f}s){self._token_suffix()}", "bold cyan")
 
         def _print_tool_detail(self, detail: str):
-            if len(detail) > 200:
-                detail = detail[:197] + "..."
-            rc = self._try_rich()
-            if rc:
-                rc.print(f"    [cyan]    {detail}[/]")
-            else:
-                print(f"        {detail}", flush=True)
+            _rprint(detail[:200], "cyan")
 
         def _print_tool_content(self, text: str):
-            """Print tool content preview line (file content, diff, etc.)."""
-            if len(text) > 150:
-                text = text[:147] + "..."
-            rc = self._try_rich()
-            if rc:
-                # diff 着色
-                if text.startswith("+") and not text.startswith("+++"):
-                    rc.print(f"    [green]      {text}[/]")
-                elif text.startswith("-") and not text.startswith("---"):
-                    rc.print(f"    [red]      {text}[/]")
-                elif text.startswith("@@") or text.startswith("---") or text.startswith("+++"):
-                    rc.print(f"    [cyan]      {text}[/]")
-                elif text.startswith("*** "):
-                    rc.print(f"    [bold cyan]      {text}[/]")
-                else:
-                    rc.print(f"    [dim]      {text}[/]")
+            text = text[:150]
+            if text.startswith("+") and not text.startswith("+++"):
+                _rprint(f"  {text}", "green")
+            elif text.startswith("-") and not text.startswith("---"):
+                _rprint(f"  {text}", "red")
             else:
-                print(f"          {text}", flush=True)
+                _rprint(f"  {text}", "dim")
 
         def _print_token_line(self, text: str):
-            if len(text) > 200:
-                text = text[:197] + "..."
-            rc = self._try_rich()
-            if rc:
-                rc.print(f"    [dim]| {text}[/]")
-            else:
-                print(f"    | {text}", flush=True)
-
-        def is_timed_out(self) -> bool:
-            """Whether the monitor triggered a stale-thinking timeout."""
-            return self._timed_out.is_set()
+            _rprint(f"| {text[:200]}", "dim")
 
         def _run(self):
             last_activity = time.time()
             last_real_activity = time.time()  # 只在有真实内容时更新
             while not self._stop.wait(0.3):
-                printed = self._tail_token_log()
+                activity_type = self._tail_token_log()
                 now = time.time()
-                if printed:
+                if activity_type:
                     last_activity = now
-                    last_real_activity = now
+                    # Only real content (tokens, tool calls) resets the stale timer.
+                    # Proxy heartbeats and stream markers ("heartbeat") do NOT.
+                    if activity_type == "content":
+                        last_real_activity = now
                 elif (now - last_activity) >= self._interval:
                     elapsed = now - self._start
                     stale = now - last_real_activity
-                    # 检测 LLM 长时间无进展
                     if self._stale_timeout and stale > self._stale_timeout:
-                        rc = self._try_rich()
-                        msg = (f"    LLM stale for {stale:.0f}s "
-                               f"(>{self._stale_timeout:.0f}s), aborting to retry...")
-                        if rc:
-                            rc.print(f"    [bold yellow]{msg}[/]")
-                        else:
-                            print(f"    {msg}", flush=True)
-                        self._timed_out.set()
+                        _rprint(f"LLM stale for {stale:.0f}s (>{self._stale_timeout:.0f}s), aborting...", "bold yellow")
                         # Signal client to NOT recover — propagate the error
                         if self._client_ref is not None:
                             self._client_ref._stale_timeout_event.set()
@@ -614,23 +429,26 @@ class OpenCodeClient(AgentClient):
                     self._print_thinking(elapsed)
                     last_activity = now
 
-        def _tail_token_log(self) -> bool:
+        def _tail_token_log(self) -> str | None:
+            """Tail the token log. Returns "content" for real LLM output,
+            "heartbeat" for proxy keep-alive signals, or None for no activity."""
             if not self._token_log:
-                return False
+                return None
             try:
                 size = self._token_log.stat().st_size
                 if size <= self._log_offset:
-                    return False
+                    return None
                 with open(self._token_log, "r", encoding="utf-8", errors="replace") as f:
                     f.seek(self._log_offset)
                     new = f.read(size - self._log_offset)
                 self._log_offset = size
                 if not new:
-                    return False
+                    return None
             except Exception:
-                return False
+                return None
 
-            printed = False
+            has_content = False
+            has_heartbeat = False
             # Count raw streaming chars for real-time token estimation.
             # Exclude control lines ([TOOL], [DBG], stream markers) — only
             # actual LLM output text contributes to the estimate.
@@ -651,15 +469,15 @@ class OpenCodeClient(AgentClient):
                                     break
                         except (ValueError, IndexError):
                             pass
-                        printed = True  # count as activity
+                        has_heartbeat = True  # stream marker = proxy activity only
                         continue
                     if ">>> stream" in line:
                         self._proxy_rounds += 1
-                        printed = True  # count as activity to delay stale timeout
+                        has_heartbeat = True  # stream marker = proxy activity only
                         continue
                     # Heartbeat from proxy (reasoning models produce no visible tokens)
                     if line.startswith("[HEARTBEAT]"):
-                        printed = True  # keep stale timeout at bay
+                        has_heartbeat = True  # proxy heartbeat, NOT real content
                         continue
                     # 过滤噪音
                     if ("[DBG" in line
@@ -670,24 +488,24 @@ class OpenCodeClient(AgentClient):
                     if line.startswith("[TOOL_CONTENT] "):
                         content = line[15:]
                         self._print_tool_content(content)
-                        printed = True
+                        has_content = True
                         continue
                     # [TOOL_DETAIL] → 详细信息（缩进显示在 [TOOL] 下方）
                     if line.startswith("[TOOL_DETAIL] "):
                         detail = line[14:].strip()
                         self._print_tool_detail(detail)
-                        printed = True
+                        has_content = True
                         continue
                     # [TOOL] → agent 正在调用工具
                     if line.startswith("[TOOL] "):
                         tool_name = line[7:].strip()
                         elapsed = time.time() - self._start
                         self._print_tool_call(tool_name, elapsed)
-                        printed = True
+                        has_content = True
                         continue
                     self._proxy_stream_chars += len(line)
                     self._print_token_line(line)
-                    printed = True
+                    has_content = True
                 else:
                     self._line_buf += ch
                     # Flush partial tokens every 80 chars (show streaming progress)
@@ -702,21 +520,17 @@ class OpenCodeClient(AgentClient):
                             if text and "[DBG" not in text:
                                 self._proxy_stream_chars += len(text)
                                 self._print_token_line(text)
-                                printed = True
+                                has_content = True
                             self._line_buf = ""
-            return printed
+            if has_content:
+                return "content"
+            if has_heartbeat:
+                return "heartbeat"
+            return None
 
-    def run(self, text: str, *, fsm_state: str, iter_idx: int, purpose: str, on_turn=None) -> AgentResult:
+    def run(self, text: str, *, on_turn=None) -> AgentResult:
         policy = ToolPolicy(
             repo=self._repo.resolve(),
-            plan_path=(self._repo / self._plan_rel).resolve(),
-            pipeline_path=((self._repo / self._pipeline_rel).resolve() if self._pipeline_rel else None),
-            purpose=purpose,
-            bash_mode=select_bash_mode(
-                purpose=purpose,
-                default_bash_mode=self._bash_mode,
-                scaffold_bash_mode=self._scaffold_bash_mode,
-            ),
             unattended=self._unattended,
         )
 
@@ -730,7 +544,7 @@ class OpenCodeClient(AgentClient):
                 monitor = self._LLMWaitMonitor(
                     self._token_log_path, turn_idx + 1,
                     stale_timeout=self._stale_timeout,
-                    server_proc=self._proc if hasattr(self, '_proc') else None,
+                    server_proc=self._proc,
                 )
                 monitor._client_ref = self  # allow monitor to signal stale timeout
             try:
@@ -793,79 +607,79 @@ class OpenCodeClient(AgentClient):
                                 texts.append(t)
                     assistant_text = "\n".join(texts) or str(msg)
             calls = parse_tool_calls(assistant_text)
+            turn_num = turn_idx + 1
+            text_tail = tail(assistant_text or "", 4000)
+
             if not calls:
-                _trace_entry: dict[str, Any] = {
-                    "turn": int(turn_idx + 1),
-                    "assistant_text_tail": tail(assistant_text or "", 4000),
-                    "calls": [],
-                    "results": [],
+                entry: dict[str, Any] = {
+                    "turn": turn_num, "assistant_text_tail": text_tail,
+                    "calls": [], "results": [],
                 }
                 if ctx_info is not None:
-                    _trace_entry["tokens"] = ctx_info
-                trace.append(_trace_entry)
+                    entry["tokens"] = ctx_info
+                trace.append(entry)
                 if on_turn:
-                    on_turn(TurnEvent(turn=turn_idx + 1, assistant_text=assistant_text, finished=True))
+                    on_turn(TurnEvent(turn=turn_num, assistant_text=assistant_text, finished=True))
                 return AgentResult(assistant_text=assistant_text, raw=msg, tool_trace=trace)
 
             # 逐个执行工具调用，每完成一个就回调 on_turn，实时显示进展
-            results = execute_tool_calls(calls, repo=self._repo, policy=policy)
+            results = execute_tool_calls(calls, policy=policy)
             compact_results: list[dict[str, Any]] = []
-            calls_list = list(calls)
-            results_list = list(results)
-            for call_idx, r in enumerate(results_list):
+            for call_idx, r in enumerate(results):
                 detail = dict(r.detail or {})
-                if isinstance(detail.get("content"), str):
-                    detail["content"] = tail(detail["content"], 4000)
-                if isinstance(detail.get("stdout"), str):
-                    detail["stdout"] = tail(detail["stdout"], 4000)
-                if isinstance(detail.get("stderr"), str):
-                    detail["stderr"] = tail(detail["stderr"], 4000)
+                for key in ("content", "stdout", "stderr"):
+                    if isinstance(detail.get(key), str):
+                        detail[key] = tail(detail[key], 4000)
                 compact_results.append(detail | {"tool": r.kind, "ok": bool(r.ok)})
 
                 # 实时回调：每完成一个工具调用就通知，让 stream printer 显示进展
-                if on_turn and call_idx < len(calls_list):
+                if on_turn:
                     on_turn(TurnEvent(
-                        turn=turn_idx + 1,
+                        turn=turn_num,
                         assistant_text=assistant_text if call_idx == 0 else "",
-                        calls=[calls_list[call_idx]],
-                        results=[results_list[call_idx]],
+                        calls=[calls[call_idx]],
+                        results=[results[call_idx]],
                     ))
 
-            _trace_entry2: dict[str, Any] = {
-                "turn": int(turn_idx + 1),
-                "assistant_text_tail": tail(assistant_text or "", 4000),
+            entry = {
+                "turn": turn_num, "assistant_text_tail": text_tail,
                 "calls": [
                     {
                         "kind": str(c.kind),
                         "payload": c.payload if isinstance(c.payload, (dict, list, str, int, float, bool)) else str(c.payload),
                     }
-                    for c in calls_list
+                    for c in calls
                 ],
                 "results": compact_results,
             }
             if ctx_info is not None:
-                _trace_entry2["tokens"] = ctx_info
-            trace.append(_trace_entry2)
-
-            # For scaffold runs, we don't need the agent to "finish talking" if the contract
-            # is already valid. Some models keep emitting extra tool calls indefinitely.
-            if str(purpose or "").strip().lower() == "scaffold_contract" and self._pipeline_rel:
-                try:
-                    from ..core.pipeline_spec import load_pipeline_spec
-                    from ..contract.validation import validate_scaffold_contract
-
-                    pipeline_path = (self._repo / self._pipeline_rel).resolve()
-                    if pipeline_path.exists():
-                        parsed = load_pipeline_spec(pipeline_path)
-                        report = validate_scaffold_contract(self._repo, pipeline=parsed, require_metrics=True)
-                        if not report.errors:
-                            return AgentResult(assistant_text=assistant_text, raw=msg, tool_trace=trace)
-                except Exception:
-                    pass
+                entry["tokens"] = ctx_info
+            trace.append(entry)
 
             prompt = format_tool_results(results)
 
         raise RuntimeError(f"OpenCode tool loop exceeded {self._max_turns} turns without a final response.")
+
+    def _inject_permissions(self, env: dict) -> None:
+        """Create temp opencode config with permission overrides."""
+        xdg = str(env.get("XDG_CONFIG_HOME") or "").strip()
+        cfg_home = Path(xdg) if xdg else Path.home() / ".config"
+        cfg_path = cfg_home / "opencode" / "opencode.json"
+        if not cfg_path.exists():
+            return
+        try:
+            cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return
+        if not isinstance(cfg, dict):
+            return
+        perms = cfg.setdefault("permission", {})
+        perms.update(self._permission_overrides)
+        self._temp_config_home = Path(tempfile.mkdtemp(prefix="opencode_perm_"))
+        tmp_dir = self._temp_config_home / "opencode"
+        tmp_dir.mkdir(parents=True)
+        (tmp_dir / "opencode.json").write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
+        env["XDG_CONFIG_HOME"] = str(self._temp_config_home)
 
     def _start_local_server(
         self,
@@ -900,24 +714,9 @@ class OpenCodeClient(AgentClient):
             self._start_llm_proxy(env, server_log_path.parent)
 
         # If proxy didn't create a temp config but we have permission overrides,
-        # create a temp config now to inject them.
-        if self._permission_overrides and not hasattr(self, "_temp_config_home"):
-            xdg = str(env.get("XDG_CONFIG_HOME") or "").strip()
-            cfg_home = Path(xdg) if xdg else Path.home() / ".config"
-            cfg_path = cfg_home / "opencode" / "opencode.json"
-            if cfg_path.exists():
-                import copy
-                cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
-                perms = cfg.setdefault("permission", {})
-                for pk, pv in self._permission_overrides.items():
-                    perms[pk] = pv
-                self._temp_config_home = Path(tempfile.mkdtemp(prefix="opencode_perm_"))
-                tmp_dir = self._temp_config_home / "opencode"
-                tmp_dir.mkdir(parents=True)
-                (tmp_dir / "opencode.json").write_text(
-                    json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8",
-                )
-                env["XDG_CONFIG_HOME"] = str(self._temp_config_home)
+        # create one now to inject them.
+        if self._permission_overrides and self._temp_config_home is None:
+            self._inject_permissions(env)
 
         cmd = ["opencode", "serve", "--hostname", host, "--port", str(port)]
 
@@ -1028,15 +827,13 @@ class OpenCodeClient(AgentClient):
         # ---- 3. Redirect OpenCode to the proxy ----
         # a) If we found an OpenCode config with the provider, create a temp
         #    copy with baseURL pointing at the proxy.
-        if config_data and provider_id in config_data.get("provider", {}):
+        if isinstance(config_data, dict) and provider_id in config_data.get("provider", {}):
             import copy
             patched = copy.deepcopy(config_data)
-            patched["provider"][provider_id]["options"]["baseURL"] = proxy_base
+            patched["provider"][provider_id].setdefault("options", {})["baseURL"] = proxy_base
             # Inject permission overrides (key is "permission" singular in OpenCode)
             if self._permission_overrides:
-                perms = patched.setdefault("permission", {})
-                for perm_key, perm_val in self._permission_overrides.items():
-                    perms[perm_key] = perm_val
+                patched.setdefault("permission", {}).update(self._permission_overrides)
             self._temp_config_home = Path(tempfile.mkdtemp(prefix="opencode_proxy_"))
             temp_cfg_dir = self._temp_config_home / "opencode"
             temp_cfg_dir.mkdir(parents=True)
@@ -1068,11 +865,63 @@ class OpenCodeClient(AgentClient):
             self._token_log_path = None
             return
 
+    def _wait_health(self, label: str = "server") -> None:
+        """Poll /global/health until the server responds (up to 60s)."""
+        start = time.time()
+        last_err = ""
+        dots = 0
+        while time.time() - start < 60:
+            try:
+                self._request_json("GET", "/global/health", body=None, require_auth=bool(self._server.password))
+                print(f"    {label} ready ({time.time() - start:.1f}s)", flush=True)
+                return
+            except Exception as e:
+                last_err = str(e)
+                dots += 1
+                if dots % 25 == 0:
+                    print(f"    waiting for {label}... ({time.time() - start:.0f}s)", flush=True)
+                time.sleep(0.2)
+        raise RuntimeError(f"OpenCode {label} failed health check: {tail(last_err, 2000)}")
+
+    def _create_session(self) -> None:
+        """Create a new session and store the session ID."""
+        data = self._request_json("POST", "/session", body={"title": self._session_title},
+                                  require_auth=bool(self._server.password))
+        sid = None
+        if isinstance(data, dict):
+            sid = data.get("id") or data.get("sessionID")
+        if not isinstance(sid, str) or not sid.strip():
+            raise RuntimeError(f"unexpected /session response: {tail(json.dumps(data, ensure_ascii=False), 2000)}")
+        self._session_id = sid
+
+    def _recover_server(self, reason: str, recover_idx: int) -> None:
+        """Restart the local server and create a fresh session."""
+        _exit_code = self._proc.poll() if self._proc else "no_proc"
+        print(f"    [diag] transport error: {reason}", flush=True)
+        print(f"    [diag] server exit_code={_exit_code}, recover_try={recover_idx}", flush=True)
+        username = self._server.username if self._server else "opencode"
+        self._stop_local_server()
+        self._server = self._start_local_server(repo=self._repo, server_log_path=self._server_log_path,
+                                                 username=username, append_log=True)
+        self._wait_health("recovered server")
+        self._create_session()
+
+    @staticmethod
+    def _is_transport_error(e: OpenCodeRequestError) -> bool:
+        if e.status is not None:
+            return False
+        d = str(e.detail or "").lower()
+        return any(n in d for n in (
+            "connection refused", "connection reset", "connection aborted",
+            "connection closed", "remote end closed", "timed out", "timeout",
+            "network is unreachable", "name or service not known",
+        ))
+
     def _post_message_with_retry(self, *, model: Any, text: str) -> Any:
-        attempts = 1 + int(self._request_retry_attempts or 0)
+        attempts = 1 + self._request_retry_attempts
         include_context = True
         last_err: OpenCodeRequestError | None = None
-        recover_budget = int(self._session_recover_attempts or 0) if self._owns_local_server else 0
+        recover_budget = self._session_recover_attempts if self._owns_local_server else 0
         recover_tries = 0
 
         for attempt in range(1, attempts + 1):
@@ -1080,8 +929,8 @@ class OpenCodeClient(AgentClient):
                 return self._post_message(model=model, text=text, include_context=include_context)
             except OpenCodeRequestError as e:
                 last_err = e
-                # Some OpenCode builds may reject unknown fields; degrade gracefully.
-                if include_context and self._context_length is not None and e.status in (400, 422):
+                # Degrade: some builds reject contextLength field
+                if include_context and self._context_length and e.status in (400, 422):
                     include_context = False
                     try:
                         return self._post_message(model=model, text=text, include_context=False)
@@ -1089,146 +938,31 @@ class OpenCodeClient(AgentClient):
                         last_err = e2
                         e = e2
 
-                transport_unavailable = False
-                if e.status is None:
-                    d = str(e.detail or "").strip().lower()
-                    if d:
-                        needles = (
-                            "connection refused",
-                            "failed to establish a new connection",
-                            "connection reset",
-                            "connection aborted",
-                            "connection closed",
-                            "remote end closed",
-                            "network is unreachable",
-                            "name or service not known",
-                            "temporary failure in name resolution",
-                            "timed out",
-                            "timeout",
-                        )
-                        transport_unavailable = any(n in d for n in needles)
-
-                # If stale timeout killed the server, don't recover — let it propagate
+                # Stale timeout — propagate immediately
                 if getattr(self, '_stale_timeout_event', None) and self._stale_timeout_event.is_set():
-                    raise StaleThinkingTimeout(
-                        f"LLM stale thinking timeout — server killed by monitor"
-                    ) from e
+                    raise StaleThinkingTimeout("LLM stale thinking timeout") from e
 
-                if transport_unavailable and recover_tries < recover_budget:
+                # Server recovery
+                if self._is_transport_error(e) and recover_tries < recover_budget:
                     recover_tries += 1
-                    # 诊断：打印触发恢复的原因和 server 进程状态
-                    _proc = getattr(self, '_proc', None)
-                    _exit_code = _proc.poll() if _proc else "no_proc"
-                    print(f"    [diag] transport error: {e.detail}", flush=True)
-                    print(f"    [diag] server process exit_code={_exit_code}, recover_try={recover_tries}/{recover_budget}", flush=True)
                     try:
-                        recover_fn = getattr(self, "_recover_local_server_session", None)
-                        if callable(recover_fn):
-                            recover_fn(reason=e.detail)
-                        else:
-                            if not self._owns_local_server:
-                                raise RuntimeError("session_recover_not_local_server")
-                            username = (
-                                str(getattr(self, "_server", None).username).strip()
-                                if getattr(self, "_server", None) is not None
-                                else "opencode"
-                            ) or "opencode"
-                            self._stop_local_server()
-                            self._server = self._start_local_server(
-                                repo=self._repo,
-                                server_log_path=self._server_log_path,
-                                username=username,
-                                append_log=True,
-                            )
-
-                            deadline = time.time() + 60
-                            last_health_err = ""
-                            _rh_start = time.time()
-                            _rh_dots = 0
-                            print(f"    recovering server...", flush=True)
-                            while time.time() < deadline:
-                                try:
-                                    self._request_json(
-                                        "GET",
-                                        "/global/health",
-                                        body=None,
-                                        require_auth=bool(self._server.password),
-                                    )
-                                    print(f"    server recovered ({time.time() - _rh_start:.1f}s)", flush=True)
-                                    break
-                                except Exception as health_exc:
-                                    last_health_err = str(health_exc)
-                                    _rh_dots += 1
-                                    if _rh_dots % 25 == 0:
-                                        print(f"    waiting for server... ({time.time() - _rh_start:.0f}s)", flush=True)
-                                    time.sleep(0.2)
-                            else:
-                                raise RuntimeError(
-                                    f"OpenCode server failed health check: {tail(last_health_err, 2000)}"
-                                )
-
-                            data = self._request_json(
-                                "POST",
-                                "/session",
-                                body={"title": self._session_title},
-                                require_auth=bool(self._server.password),
-                            )
-                            if isinstance(data, dict) and isinstance(data.get("id"), str) and data["id"].strip():
-                                self._session_id = data["id"]
-                            elif (
-                                isinstance(data, dict)
-                                and isinstance(data.get("sessionID"), str)
-                                and data["sessionID"].strip()
-                            ):
-                                self._session_id = data["sessionID"]
-                            else:
-                                raise RuntimeError(
-                                    f"unexpected /session response: {tail(json.dumps(data, ensure_ascii=False), 2000)}"
-                                )
-                    except Exception as recover_exc:
-                        last_err = OpenCodeRequestError(
-                            method=e.method,
-                            url=e.url,
-                            status=e.status,
-                            detail=f"{e.detail}; recover_failed: {tail(str(recover_exc), 1200)}",
-                        )
+                        self._recover_server(e.detail, recover_tries)
+                    except Exception as re:
+                        last_err = OpenCodeRequestError(method=e.method, url=e.url, status=e.status,
+                                                         detail=f"{e.detail}; recover_failed: {tail(str(re), 1200)}")
                     else:
-                        sleep_fn = getattr(self, "_sleep_session_recover_backoff", None)
-                        if callable(sleep_fn):
-                            sleep_fn(recover_idx=recover_tries)
-                        else:
-                            base = float(self._session_recover_backoff_seconds or 0.0)
-                            if base > 0:
-                                delay = min(30.0, base * (2 ** max(0, int(recover_tries) - 1)))
-                                if delay > 0:
-                                    time.sleep(delay)
-                        continue
-
-                should_retry_fn = getattr(self, "_should_retry_request_error", None)
-                if callable(should_retry_fn):
-                    should_retry = bool(should_retry_fn(e))
-                elif e.status is None:
-                    should_retry = True
-                else:
-                    try:
-                        code = int(e.status)
-                    except Exception:
-                        should_retry = True
-                    else:
-                        should_retry = code in (408, 409, 425, 429) or code >= 500
-
-                if attempt >= attempts or not should_retry:
-                    raise
-
-                sleep_fn = getattr(self, "_sleep_retry_backoff", None)
-                if callable(sleep_fn):
-                    sleep_fn(attempt_idx=attempt)
-                else:
-                    base = float(self._request_retry_backoff_seconds or 0.0)
-                    if base > 0:
-                        delay = min(30.0, base * (2 ** max(0, int(attempt) - 1)))
+                        delay = min(30.0, self._session_recover_backoff_seconds * (2 ** (recover_tries - 1)))
                         if delay > 0:
                             time.sleep(delay)
+                        continue
+
+                # Retry logic
+                should_retry = e.status is None or (isinstance(e.status, int) and (e.status in (408, 409, 425, 429) or e.status >= 500))
+                if attempt >= attempts or not should_retry:
+                    raise
+                delay = min(30.0, self._request_retry_backoff_seconds * (2 ** (attempt - 1)))
+                if delay > 0:
+                    time.sleep(delay)
 
         if last_err is not None:
             raise last_err

@@ -1,13 +1,20 @@
 """Pipeline prompt 构建逻辑 — 探索式自主 prompt。"""
 
 import os
-from pathlib import Path
 
 from .types import IterationResult
 
+# Shared context-size warning used across all prompt builders
+_CONTEXT_LIMITS_SECTION = """## CRITICAL: Context Size Limits（违反会导致 session 崩溃）
+- **绝对禁止** 一次性读取整个数据文件或大日志——会撑爆 context window
+- read 工具：**必须设置 limit=20**，用 offset 翻页
+- grep：加 `-m 10`，如 `grep -n 'pattern' file | head -10`
+- 大日志：先 `wc -l` 看行数，再 `tail -30` 看末尾
+- **禁止用 inspect.getsource() 读库源码**
+- **DO NOT read entire data files or log files**"""
+
 
 def build_code_prompt(
-    iteration: int,
     workspace: str,
     base_model: str,
     task_description: str,
@@ -105,13 +112,8 @@ def build_code_prompt(
 - 你只负责写代码，不要自己执行训练脚本。pipeline 会用 accelerate 自动运行
 - 完成后调用 finish 工具结束
 
-## CRITICAL: Context Size Limits（违反会导致 session 崩溃）
-- **绝对禁止** 一次性读取整个数据文件（jsonl、csv、parquet 等），这些文件可能有数万行，
-  单次读取会直接撑爆 LLM context window，导致 session 崩溃、timeout、无法恢复
+{_CONTEXT_LIMITS_SECTION}
 - 查看数据格式：只用 `head -3 file` 或 `python3 -c "..."` 采样前 3-5 条
-- read 工具：**必须设置 limit=20**，用 offset 翻页
-- grep：加 `-m 10` 限制匹配数量，如 `grep -n 'pattern' file | head -10`
-- 大日志文件：先 `wc -l` 看行数，再 `tail -30` 看末尾
 - **错误示例（绝对禁止）**：`cat file.py`、`cat data.jsonl`、不带 limit 的 read、`sed -n '1,500p'`、不加限制的 grep
 - **正确示例**：`head -3 train.jsonl`、`read file limit=20`、`grep -n 'error' log | head -10`
 
@@ -148,13 +150,7 @@ def build_fix_prompt(
 6. 不要运行完整训练——pipeline 会执行
 7. 完成后调用 finish 工具结束
 
-## CRITICAL: Context Size Limits（违反会导致 session 崩溃）
-- **绝对禁止** 一次性读取整个数据文件或大日志——会撑爆 context window
-- read 工具：**必须设置 limit=20**，用 offset 翻页
-- grep：加 `-m 10`，如 `grep -n 'error' log | head -10`
-- 大日志：先 `wc -l` 看行数，再 `tail -30` 看末尾
-- **禁止用 inspect.getsource() 读库源码**
-- **DO NOT read entire data files** — 只采样前几条
+{_CONTEXT_LIMITS_SECTION}
 """
 
 
@@ -195,12 +191,7 @@ def build_analysis_prompt(
 
 用日志中的具体数据支撑你的分析（引用 loss 趋势等）。
 
-## CRITICAL: Context Size Limits（违反会导致 session 崩溃）
-- **绝对禁止** 一次性读取整个日志或数据文件——会撑爆 context window
-- read 工具：**必须设置 limit=20**，用 offset 翻页
-- grep：加 `-m 10`，如 `grep -n 'loss' log | head -10`
-- 大日志：先 `wc -l` 看行数，再 `tail -30` 看末尾
-- **DO NOT read entire data files or log files**
+{_CONTEXT_LIMITS_SECTION}
 
 完成后调用 finish 工具结束。
 """

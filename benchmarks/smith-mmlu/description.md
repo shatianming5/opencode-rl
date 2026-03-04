@@ -1,1 +1,1 @@
-/data/userdata/v-tiansha/RD-Agent/rdagent/scenarios/rl/autorl_bench/benchmarks/smith/mmlu/description.md
+/data/userdata/v-tiansha/rl-smith/benchmarks/mmlu/description.md
