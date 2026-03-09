@@ -109,6 +109,9 @@ def build_code_prompt(
 ## 提示
 - 可以用 `python3 -c "..."` 快速验证想法
 {method_hints}
+- **可以用 websearch 联网搜索**最新的 TRL/GRPO 用法、训练技巧、最佳实践
+- **可以用 webfetch 抓取网页**（如 HuggingFace 文档、GitHub 示例代码）
+- 遇到不确定的 API 用法时，优先 websearch 搜索示例代码，比逐行读库源码高效得多
 - 你只负责写代码，不要自己执行训练脚本。pipeline 会用 accelerate 自动运行
 - 完成后调用 finish 工具结束
 
@@ -119,9 +122,9 @@ def build_code_prompt(
 
 ## 效率要求（严格遵守）
 - **禁止用 inspect.getsource() 逐函数阅读库源码**，这会导致上下文爆炸、LLM 响应超时
-- 了解库 API：用 `python3 -c "from trl import GRPOTrainer; help(GRPOTrainer)"` 查看文档
+- 了解库 API：优先用 **websearch** 搜索官方文档和示例，或用 `python3 -c "from trl import GRPOTrainer; help(GRPOTrainer)"` 查看文档
 - 验证参数签名：用 `python3 -c "import inspect; from trl import GRPOConfig; print(inspect.signature(GRPOConfig))"`
-- **不要花超过 3 步探索**，尽快开始写代码。你已经知道 TRL、transformers、PEFT 的基本用法
+- **不要花超过 5 步探索**，尽快开始写代码。你已经知道 TRL、transformers、PEFT 的基本用法
 - 写完代码后立即调用 finish，不要反复检查和优化
 - **DO NOT read entire data files** — 只采样前几条理解格式即可
 {history_section}"""
