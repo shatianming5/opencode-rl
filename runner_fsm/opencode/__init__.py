@@ -1,1 +1,1 @@
-"""OpenCode client and tool execution."""
+"""OpenCode agent client (opencode run wrapper)."""

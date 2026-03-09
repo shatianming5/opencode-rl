@@ -10,7 +10,7 @@ from pathlib import Path
 
 import requests
 
-from runner_fsm.opencode.client import OpenCodeClient
+from runner_fsm.opencode.run_client import RunClient
 
 from .prompts import (
     build_analysis_prompt,
@@ -34,45 +34,55 @@ def _resolve_model(opencode_model: str) -> str:
 
 def _make_agent(
     workspace: str,
-    iteration: int,
-    session_name: str,
     opencode_model: str = "",
-    opencode_url: str = "",
-    max_agent_steps: int = 30,
     stale_timeout: float = 180.0,
-    http_timeout: float = 300.0,
-) -> OpenCodeClient:
-    """Create an OpenCodeClient with shared defaults for all pipeline phases."""
+    http_timeout: float = 900.0,
+) -> RunClient:
+    """Create a RunClient for pipeline phases."""
     model = _resolve_model(opencode_model)
-    server_url = opencode_url or os.environ.get("OPENCODE_URL", "") or None
     repo_root = Path(workspace).resolve()
-    log_dir = repo_root / "code" / "agent_logs"
-    log_dir.mkdir(parents=True, exist_ok=True)
-    return OpenCodeClient(
+    return RunClient(
         repo=repo_root,
         model=model,
-        base_url=server_url,
-        timeout_seconds=http_timeout,
-        unattended="strict",
-        max_turns=max_agent_steps,
-        server_log_path=log_dir / f"opencode_{session_name}_iter{iteration}.log",
-        session_title=f"{session_name}_iter{iteration}",
-        stale_timeout=stale_timeout,
-        auto_compact=True,
-        context_length=128000,
-        max_prompt_chars=80000,
-        permission_overrides={"external_directory": {"*": "allow"}},
+        timeout_seconds=int(http_timeout + stale_timeout),
     )
 
 
 def _log_phase_start(prompt: str, opencode_model: str) -> None:
     """Print shared phase startup info (prompt size, model, starting server)."""
     model = _resolve_model(opencode_model)
-    console.print(f"  [dim]Prompt:[/] {len(prompt)} chars  [dim]Model:[/] {model}  [dim]Starting server...[/]")
+    console.print(f"  [dim]Prompt:[/] {len(prompt)} chars  [dim]Model:[/] {model}")
+
+
+def _save_agent_log(
+    log_dir: Path,
+    purpose: str,
+    iteration: int,
+    result: "AgentResult | None",
+    error_msg: str = "",
+) -> None:
+    """Save agent log: assistant text + tool trace + any error."""
+    log_parts: list[str] = []
+    if error_msg:
+        log_parts.append(f"[ERROR] {error_msg}")
+    if result:
+        if result.assistant_text:
+            log_parts.append(result.assistant_text[-20000:])
+        if result.tool_trace:
+            log_parts.append("\n--- Tool Trace ---")
+            for t in result.tool_trace:
+                tool = t.get("tool", "?")
+                inp = str(t.get("input", {}))[:200]
+                out = str(t.get("output", t.get("error", "")))[:500]
+                log_parts.append(f"[{tool}] {inp}\n  => {out}")
+    if log_parts:
+        (log_dir / f"{purpose}_iter{iteration}_result.txt").write_text(
+            "\n".join(log_parts), encoding="utf-8",
+        )
 
 
 def _run_agent(
-    agent: OpenCodeClient,
+    agent: RunClient,
     prompt: str,
     iteration: int,
     purpose: str,
@@ -83,15 +93,13 @@ def _run_agent(
 
     Returns PhaseResult on failure, or assistant_text on success.
     """
-    log_dir = Path(agent._repo) / "code" / "agent_logs"
+    log_dir = Path(agent.repo) / "code" / "agent_logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    result = None
     try:
         result = agent.run(prompt, on_turn=make_stream_printer(label))
-        if result.assistant_text:
-            (log_dir / f"{purpose}_iter{iteration}_result.txt").write_text(
-                result.assistant_text[-20000:], encoding="utf-8",
-            )
-        return result.assistant_text or ""
     except Exception as e:
+        _save_agent_log(log_dir, purpose, iteration, result, str(e))
         return PhaseResult(
             success=False, phase=phase_name,
             error=f"Agent error: {e}",
@@ -101,6 +109,17 @@ def _run_agent(
             agent.close()
         except Exception:
             pass
+
+    # Agent returned — check for error (e.g. timeout with partial data)
+    if result.error:
+        _save_agent_log(log_dir, purpose, iteration, result, result.error)
+        return PhaseResult(
+            success=False, phase=phase_name,
+            error=f"Agent error: {result.error}",
+        )
+
+    _save_agent_log(log_dir, purpose, iteration, result)
+    return result.assistant_text or ""
 
 
 def _cap_stdout(collected: list[str]) -> str:
@@ -144,16 +163,14 @@ def phase_code_generation(
     base_model: str,
     task_description: str,
     history: list[IterationResult],
-    max_agent_steps: int = 30,
     gpu_info: dict | None = None,
     opencode_model: str = "",
-    opencode_url: str = "",
     stale_timeout: float = 180.0,
-    http_timeout: float = 300.0,
+    http_timeout: float = 900.0,
     task_type: str = "math",
     expose_files: tuple[str, ...] = (),
 ) -> PhaseResult:
-    """Phase 1: 代码生成 — 用 OpenCodeClient 探索数据并编写训练代码。"""
+    """Phase 1: 代码生成 — 用 agent 探索数据并编写训练代码。"""
     print_phase_header("Code Generation", f"iteration {iteration}")
 
     prompt = build_code_prompt(
@@ -162,8 +179,7 @@ def phase_code_generation(
     )
     _log_phase_start(prompt, opencode_model)
 
-    agent = _make_agent(workspace, iteration, "codegen", opencode_model,
-                        opencode_url, max_agent_steps, stale_timeout, http_timeout)
+    agent = _make_agent(workspace, opencode_model, stale_timeout, http_timeout)
     out = _run_agent(agent, prompt, iteration,
                      "code_generation", f"CodeGen iter{iteration}", "code_gen")
     if isinstance(out, PhaseResult):
@@ -375,17 +391,14 @@ def phase_fix_training(
     workspace: str,
     iteration: int = 0,
     opencode_model: str = "",
-    opencode_url: str = "",
-    max_agent_steps: int = 30,
     stale_timeout: float = 180.0,
-    http_timeout: float = 300.0,
+    http_timeout: float = 900.0,
 ) -> PhaseResult:
-    """训练失败后的修复尝试，使用 OpenCodeClient。"""
+    """训练失败后的修复尝试。"""
     fix_prompt = build_fix_prompt(code_path, error_log_path, data_path)
     _log_phase_start(fix_prompt, opencode_model)
 
-    agent = _make_agent(workspace, iteration, "fix", opencode_model,
-                        opencode_url, max_agent_steps, stale_timeout, http_timeout)
+    agent = _make_agent(workspace, opencode_model, stale_timeout, http_timeout)
     out = _run_agent(agent, fix_prompt, iteration,
                      "fix_training", "FixTraining", "fix_training")
     if isinstance(out, PhaseResult):
@@ -400,11 +413,9 @@ def phase_analysis(
     training_log_path: str,
     score: float | None = None,
     opencode_model: str = "",
-    opencode_url: str = "",
-    max_agent_steps: int = 30,
     evaluation_summary: str = "",
     stale_timeout: float = 180.0,
-    http_timeout: float = 300.0,
+    http_timeout: float = 900.0,
 ) -> PhaseResult:
     """Phase Analysis: 自分析诊断 — 输出 analysis.md 供下一轮参考。"""
     print_phase_header("Analysis", f"self-diagnosis (iteration {iteration})")
@@ -415,8 +426,7 @@ def phase_analysis(
     )
     _log_phase_start(prompt, opencode_model)
 
-    agent = _make_agent(workspace, iteration, "analysis", opencode_model,
-                        opencode_url, max_agent_steps, stale_timeout, http_timeout)
+    agent = _make_agent(workspace, opencode_model, stale_timeout, http_timeout)
     out = _run_agent(agent, prompt, iteration,
                      "analysis", f"Analysis iter{iteration}", "analysis")
     if isinstance(out, PhaseResult):

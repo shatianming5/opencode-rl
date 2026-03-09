@@ -20,16 +20,12 @@ from pipeline.utils import resolve_model_path
 
 
 def _cleanup_active_clients():
-    """Close all active OpenCodeClient instances to prevent orphan processes."""
+    """Kill all active opencode run subprocesses to prevent orphan processes."""
     try:
-        from runner_fsm.opencode.client import _active_clients
+        from runner_fsm.opencode.run_client import cleanup_active_procs
+        cleanup_active_procs()
     except ImportError:
-        return
-    for client in list(_active_clients):
-        try:
-            client.close()
-        except Exception:
-            pass
+        pass
 
 
 def _signal_handler(signum, frame):

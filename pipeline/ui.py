@@ -163,112 +163,124 @@ def print_evaluation_report(score, improvement, best_score, submission_id=None):
 
 
 # ---------------------------------------------------------------------------
-# Stream printer (Turn-level output helpers)
-# ---------------------------------------------------------------------------
-def print_turn_header(label: str, turn: int, elapsed: float):
-    """Print a turn header for agent interaction."""
-    console.print(
-        f"\n  [{STYLE_SUBHEADER}][{label}][/] "
-        f"Turn {turn} [dim]({elapsed:.0f}s)[/]"
-    )
-
-
-def print_turn_done(label: str, turn: int, elapsed: float):
-    """Print turn completion."""
-    console.print(
-        f"  [{STYLE_SUCCESS}][{label}] Done[/] "
-        f"[dim](turn {turn}, {elapsed:.0f}s)[/]"
-    )
-
-
-def print_turn_waiting(label: str):
-    """Print waiting message."""
-    console.print(f"  [{STYLE_DIM}][{label}] Waiting for agent response...[/]")
-
-
-def print_agent_thought(text: str):
-    """Print agent reasoning summary."""
-    console.print(f"    [{STYLE_AGENT}]Agent:[/] {text}")
-
-
-def print_tool_call(kind: str, detail: str):
-    """Print a tool call (from Turn data, not proxy)."""
-    console.print(f"    [{STYLE_TOOL}]> {kind}:[/] {detail}")
-
-
-def print_tool_result(text: str, ok: bool = True):
-    """Print a tool call result."""
-    style = "green" if ok else "red"
-    console.print(f"    [{style}]< {text}[/]")
-
-
-# ---------------------------------------------------------------------------
 # Stream printer (on_turn callback for agent phases)
 # ---------------------------------------------------------------------------
 def make_stream_printer(label: str):
-    """Return an on_turn callback that prints agent turns in real-time."""
+    """Return an on_turn callback that prints agent events in real-time.
+
+    Displays:
+    - Tool calls with full input and output (no truncation)
+    - Agent text responses
+    - Token statistics per step
+    - Turn progress
+    """
     start = time.time()
     last_turn = [0]
-    print_turn_waiting(label)
+    console.print(f"  [{STYLE_DIM}][{label}] Waiting for agent...[/]")
 
     def _print(event):
         elapsed = time.time() - start
 
         if event.finished:
-            print_turn_done(label, event.turn, elapsed)
+            console.print(
+                f"  [{STYLE_SUCCESS}][{label}] Done[/] "
+                f"[dim](turn {event.turn}, {elapsed:.0f}s)[/]"
+            )
             return
 
-        if event.turn != last_turn[0]:
+        # New turn header
+        if event.turn != last_turn[0] and event.event_type == "step_start":
             last_turn[0] = event.turn
-            print_turn_header(label, event.turn, elapsed)
+            console.print(
+                f"\n  [{STYLE_SUBHEADER}][{label}][/] "
+                f"Turn {event.turn} [dim]({elapsed:.0f}s)[/]"
+            )
+            return
 
-        if event.assistant_text:
-            lines = [l.strip() for l in event.assistant_text.strip().splitlines() if l.strip()]
-            for line in lines:
-                if not line.startswith("<") and not line.startswith("```"):
-                    print_agent_thought(line[:200])
-                    break
+        # Tool running — show what's being called
+        if event.event_type == "tool_running":
+            tool = event.tool_name
+            title = event.tool_title
+            inp = event.tool_input
 
-        results = list(event.results) if event.results else []
-        for i, call in enumerate(event.calls or []):
-            result = results[i] if i < len(results) else None
-            payload = call.payload if isinstance(call.payload, dict) else {}
+            if tool == "bash":
+                cmd = str(inp.get("command", ""))
+                console.print(f"    [{STYLE_TOOL}]> bash:[/] {cmd}")
+            elif tool in ("read", "glob", "grep"):
+                detail = title or str(inp)
+                console.print(f"    [{STYLE_TOOL}]> {tool}:[/] {detail}")
+            elif tool in ("write", "edit"):
+                path = str(inp.get("filePath", inp.get("file_path", "")))
+                console.print(f"    [{STYLE_TOOL}]> {tool}:[/] {path}")
+            else:
+                detail = title or tool
+                console.print(f"    [{STYLE_TOOL}]> {detail}[/]")
+            return
 
-            if call.kind == "bash":
-                cmd = str(payload.get("command", ""))
-                if len(cmd) > 150:
-                    cmd = cmd[:147] + "..."
-                print_tool_call("bash", cmd)
-                if result:
-                    rc = result.detail.get("rc", "?")
-                    stdout = str(result.detail.get("stdout") or "").strip()
-                    stderr = str(result.detail.get("stderr") or "").strip()
-                    if result.ok:
-                        out = stdout[:200].replace("\n", " | ") if stdout else ""
-                        print_tool_result(f"(rc={rc}) {out}", ok=True)
-                    else:
-                        err = stderr[:200].replace("\n", " | ") if stderr else stdout[:200].replace("\n", " | ")
-                        print_tool_result(f"(rc={rc}) {err}", ok=False)
+        # Tool completed — show full output
+        if event.event_type == "tool_completed":
+            tool = event.tool_name
+            output = event.tool_output
 
-            elif call.kind == "file":
-                file_path = str(payload.get("filePath", ""))
-                if result is None:
-                    print_tool_call("file", file_path)
-                    continue
-                kind = result.kind
-                ok_str = "ok" if result.ok else str(result.detail.get("error", "failed"))
-                if kind == "read":
-                    print_tool_call("read", file_path)
-                    content = str(result.detail.get("content") or "")
-                    print_tool_result(f"ok ({len(content)} chars)" if result.ok else ok_str, ok=result.ok)
-                elif kind in ("write", "edit"):
-                    print_tool_call(kind, file_path)
-                    if result.ok:
-                        print_tool_result(f"ok ({result.detail.get('bytes', 0)} bytes, {result.detail.get('mode', kind)})", ok=True)
-                    else:
-                        print_tool_result(ok_str, ok=False)
+            if tool == "bash":
+                if output:
+                    # Show full output, indented
+                    for line in output.splitlines():
+                        console.print(f"      [dim]{line}[/]")
                 else:
-                    print_tool_call(kind, file_path)
-                    print_tool_result(ok_str, ok=result.ok)
+                    console.print(f"      [dim](no output)[/]")
+            elif tool in ("read", "glob", "grep"):
+                if output:
+                    lines = output.splitlines()
+                    for line in lines:
+                        console.print(f"      [dim]{line}[/]")
+                else:
+                    console.print(f"      [dim](empty)[/]")
+            elif tool in ("write", "edit"):
+                console.print(f"      [green]ok[/]")
+            else:
+                if output:
+                    for line in output.splitlines()[:20]:
+                        console.print(f"      [dim]{line}[/]")
+                    if len(output.splitlines()) > 20:
+                        console.print(f"      [dim]... ({len(output.splitlines())} lines total)[/]")
+            return
+
+        # Tool error
+        if event.event_type == "tool_error":
+            console.print(f"      [red]{event.tool_output}[/]")
+            return
+
+        # Agent text response
+        if event.event_type == "text" and event.assistant_text:
+            text = event.assistant_text.strip()
+            if text:
+                # Show first few lines of the response
+                lines = text.splitlines()
+                preview = lines[:5]
+                for line in preview:
+                    console.print(f"    [{STYLE_AGENT}]Agent:[/] {line}")
+                if len(lines) > 5:
+                    console.print(f"    [{STYLE_DIM}]... ({len(lines)} lines total)[/]")
+            return
+
+        # Step finish — token stats
+        if event.event_type == "step_finish":
+            tokens = event.tokens
+            if tokens:
+                inp = tokens.get("input", 0)
+                out = tokens.get("output", 0)
+                reasoning = tokens.get("reasoning", 0)
+                cache = tokens.get("cache", {})
+                cache_r = cache.get("read", 0) if isinstance(cache, dict) else 0
+                parts = [f"in={inp:,}", f"out={out:,}"]
+                if reasoning:
+                    parts.append(f"reasoning={reasoning:,}")
+                if cache_r:
+                    parts.append(f"cache_read={cache_r:,}")
+                console.print(f"    [dim][tokens] {' | '.join(parts)}[/]")
+            if event.cost:
+                console.print(f"    [dim][cost] ${event.cost:.4f}[/]")
+            return
 
     return _print

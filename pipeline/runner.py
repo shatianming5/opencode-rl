@@ -69,9 +69,8 @@ def _run_phase_code_gen(
     task_description: str,
     gpu_info: dict,
     opencode_model: str,
-    opencode_url: str,
     stale_timeout: float = 180.0,
-    http_timeout: float = 300.0,
+    http_timeout: float = 900.0,
     task_type: str = "math",
     expose_files: tuple[str, ...] = (),
 ) -> PhaseResult:
@@ -90,10 +89,8 @@ def _run_phase_code_gen(
             base_model=state.base_model,
             task_description=task_description,
             history=history,
-            max_agent_steps=state.max_agent_steps,
             gpu_info=gpu_info,
             opencode_model=opencode_model,
-            opencode_url=opencode_url,
             stale_timeout=stale_timeout,
             http_timeout=http_timeout,
             task_type=task_type,
@@ -115,9 +112,8 @@ def _run_phase_training(
     state: PipelineState,
     iter_state: IterationState,
     opencode_model: str,
-    opencode_url: str,
     stale_timeout: float = 180.0,
-    http_timeout: float = 300.0,
+    http_timeout: float = 900.0,
 ) -> PhaseResult:
     """TRAINING 阶段（含重试循环）。"""
     code_path = iter_state.code_path
@@ -127,7 +123,8 @@ def _run_phase_training(
         workspace, code_path, timeout=state.training_timeout,
     )
 
-    training_log_path = str(Path(workspace) / "code" / "training_stdout.log")
+    log_dir = Path(workspace) / "code"
+    training_log_path = str(log_dir / "training_stdout.log")
     _write_training_log(training_log_path, train_result.payload.get("stdout", ""))
 
     total_time = train_result.payload.get("elapsed", 0.0)
@@ -141,8 +138,6 @@ def _run_phase_training(
             code_path, training_log_path, state.data_path, workspace,
             iteration=iter_state.iteration,
             opencode_model=opencode_model,
-            opencode_url=opencode_url,
-            max_agent_steps=state.max_agent_steps,
             stale_timeout=stale_timeout,
             http_timeout=http_timeout,
         )
@@ -151,6 +146,14 @@ def _run_phase_training(
             break
 
         console.print(f"  [dim]Agent fix attempt done, re-running training...[/]")
+        # Archive previous training log before overwriting
+        prev_log = log_dir / f"training_stdout_retry{retry}.log"
+        try:
+            if Path(training_log_path).exists():
+                Path(training_log_path).rename(prev_log)
+        except OSError:
+            pass
+
         train_result = phase_training(
             workspace, code_path, timeout=state.training_timeout,
         )
@@ -197,9 +200,8 @@ def _run_phase_analysis(
     state: PipelineState,
     iter_state: IterationState,
     opencode_model: str,
-    opencode_url: str,
     stale_timeout: float = 180.0,
-    http_timeout: float = 300.0,
+    http_timeout: float = 900.0,
 ) -> PhaseResult:
     """ANALYSIS 阶段（含自动重试）。"""
     workspace = state.workspace
@@ -229,8 +231,6 @@ def _run_phase_analysis(
             training_log_path=training_log_path,
             score=iter_state.score,
             opencode_model=opencode_model,
-            opencode_url=opencode_url,
-            max_agent_steps=state.max_agent_steps,
             evaluation_summary=evaluation_summary,
             stale_timeout=stale_timeout,
             http_timeout=http_timeout,
@@ -261,7 +261,7 @@ def run_pipeline(
     max_retries: int = 3,
     resume: bool = False,
     stale_timeout: int = 180,
-    http_timeout: int = 300,
+    http_timeout: int = 900,
     eval_timeout: int = 600,
     task_type: str = "math",
     expose_files: tuple[str, ...] = (),
@@ -280,7 +280,7 @@ def run_pipeline(
         output_dir = os.environ.get("OUTPUT_DIR", str(Path(workspace) / "output"))
 
     opencode_model = os.environ.get("OPENCODE_MODEL", "")
-    opencode_url = os.environ.get("OPENCODE_URL", "")
+    # opencode_url removed — RunClient doesn't use a server
 
     # ----- 尝试恢复 checkpoint -----
     state: PipelineState | None = None
@@ -387,7 +387,7 @@ def run_pipeline(
             if phase == Phase.CODE_GEN:
                 result = _run_phase_code_gen(
                     state, iter_state, history, task_description,
-                    gpu_info, opencode_model, opencode_url,
+                    gpu_info, opencode_model,
                     stale_timeout=stale_timeout,
                     http_timeout=http_timeout,
                     task_type=task_type,
@@ -407,7 +407,7 @@ def run_pipeline(
 
             elif phase == Phase.TRAINING:
                 result = _run_phase_training(
-                    state, iter_state, opencode_model, opencode_url,
+                    state, iter_state, opencode_model,
                     stale_timeout=stale_timeout,
                     http_timeout=http_timeout,
                 )
@@ -449,7 +449,7 @@ def run_pipeline(
             elif phase == Phase.ANALYSIS:
                 if iteration < max_iterations:
                     result = _run_phase_analysis(
-                        state, iter_state, opencode_model, opencode_url,
+                        state, iter_state, opencode_model,
                         stale_timeout=stale_timeout,
                         http_timeout=http_timeout,
                     )
