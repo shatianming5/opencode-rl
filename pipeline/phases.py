@@ -35,7 +35,7 @@ def _resolve_model(opencode_model: str) -> str:
 def _make_agent(
     workspace: str,
     opencode_model: str = "",
-    stale_timeout: float = 180.0,
+    stale_timeout: float = 0.0,
     http_timeout: float = 900.0,
 ) -> RunClient:
     """Create a RunClient for pipeline phases."""
@@ -44,7 +44,7 @@ def _make_agent(
     return RunClient(
         repo=repo_root,
         model=model,
-        timeout_seconds=int(http_timeout + stale_timeout),
+        timeout_seconds=int(http_timeout),
     )
 
 
@@ -165,7 +165,7 @@ def phase_code_generation(
     history: list[IterationResult],
     gpu_info: dict | None = None,
     opencode_model: str = "",
-    stale_timeout: float = 180.0,
+    stale_timeout: float = 0.0,
     http_timeout: float = 900.0,
     task_type: str = "math",
     expose_files: tuple[str, ...] = (),
@@ -391,7 +391,7 @@ def phase_fix_training(
     workspace: str,
     iteration: int = 0,
     opencode_model: str = "",
-    stale_timeout: float = 180.0,
+    stale_timeout: float = 0.0,
     http_timeout: float = 900.0,
 ) -> PhaseResult:
     """训练失败后的修复尝试。"""
@@ -414,7 +414,7 @@ def phase_analysis(
     score: float | None = None,
     opencode_model: str = "",
     evaluation_summary: str = "",
-    stale_timeout: float = 180.0,
+    stale_timeout: float = 0.0,
     http_timeout: float = 900.0,
 ) -> PhaseResult:
     """Phase Analysis: 自分析诊断 — 输出 analysis.md 供下一轮参考。"""

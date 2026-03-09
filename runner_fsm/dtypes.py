@@ -1,16 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Callable, Protocol
-
-
-@dataclass(frozen=True)
-class CmdResult:
-    cmd: str
-    rc: int
-    stdout: str
-    stderr: str
-    timed_out: bool = False
+from typing import Any
 
 
 @dataclass(frozen=True)
@@ -31,11 +22,7 @@ class TurnEvent:
 @dataclass(frozen=True)
 class AgentResult:
     assistant_text: str
-    raw: Any | None = None
     tool_trace: list[dict[str, Any]] | None = None
     error: str | None = None
 
 
-class AgentClient(Protocol):
-    def run(self, text: str, *, on_turn: Callable[[TurnEvent], None] | None = None) -> AgentResult: ...
-    def close(self) -> None: ...

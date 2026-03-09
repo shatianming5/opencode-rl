@@ -1,7 +1,7 @@
 """Rich-based terminal UI for pipeline output.
 
 Provides a shared Console and formatting helpers used across
-runner.py, phases.py, and client.py.
+runner.py and phases.py.
 """
 
 from __future__ import annotations

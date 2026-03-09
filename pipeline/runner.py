@@ -69,7 +69,7 @@ def _run_phase_code_gen(
     task_description: str,
     gpu_info: dict,
     opencode_model: str,
-    stale_timeout: float = 180.0,
+    stale_timeout: float = 0.0,
     http_timeout: float = 900.0,
     task_type: str = "math",
     expose_files: tuple[str, ...] = (),
@@ -112,7 +112,7 @@ def _run_phase_training(
     state: PipelineState,
     iter_state: IterationState,
     opencode_model: str,
-    stale_timeout: float = 180.0,
+    stale_timeout: float = 0.0,
     http_timeout: float = 900.0,
 ) -> PhaseResult:
     """TRAINING 阶段（含重试循环）。"""
@@ -200,7 +200,7 @@ def _run_phase_analysis(
     state: PipelineState,
     iter_state: IterationState,
     opencode_model: str,
-    stale_timeout: float = 180.0,
+    stale_timeout: float = 0.0,
     http_timeout: float = 900.0,
 ) -> PhaseResult:
     """ANALYSIS 阶段（含自动重试）。"""
@@ -260,7 +260,7 @@ def run_pipeline(
     max_agent_steps: int = 25,
     max_retries: int = 3,
     resume: bool = False,
-    stale_timeout: int = 180,
+    stale_timeout: int = 0,
     http_timeout: int = 900,
     eval_timeout: int = 600,
     task_type: str = "math",

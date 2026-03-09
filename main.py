@@ -54,10 +54,10 @@ def main():
                         help="各阶段（code_gen/fix/analysis）失败后自动重试次数（默认 3）")
     parser.add_argument("--resume", action="store_true",
                         help="从上次 checkpoint 断点续跑（需指定 --run-dir）")
-    parser.add_argument("--stale-timeout", type=int, default=180,
-                        help="LLM 无响应超时秒数，超过后自动重试（默认 180）")
-    parser.add_argument("--http-timeout", type=int, default=300,
-                        help="OpenCode HTTP 请求超时秒数（默认 300）")
+    parser.add_argument("--stale-timeout", type=int, default=0,
+                        help="LLM 无响应超时秒数（新架构下已废弃，默认 0）")
+    parser.add_argument("--http-timeout", type=int, default=900,
+                        help="OpenCode HTTP 请求超时秒数（默认 900）")
     parser.add_argument("--eval-timeout", type=int, default=600,
                         help="Grading Server 评测请求超时秒数（默认 600）")
 

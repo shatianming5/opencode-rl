@@ -1,1 +1,1 @@
-"""OpenCode agent client (opencode run wrapper)."""
+"""OpenCode agent client (opencode serve + SSE)."""
