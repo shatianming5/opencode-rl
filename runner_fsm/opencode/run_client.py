@@ -197,9 +197,11 @@ class _EventCollector:
         self._text_parts: dict[str, str] = {}
         # Track tool state by partID
         self._tool_parts: dict[str, dict[str, Any]] = {}
-        # Track total cost/tokens from the last message.updated
+        # Accumulated cost/tokens across all API calls in this session
         self._total_cost = 0.0
         self._total_tokens: dict[str, Any] = {}
+        # Dedup: last-seen cost per message ID (opencode sends duplicates)
+        self._last_msg_cost: dict[str, float] = {}
         # Cache message roles (user vs assistant)
         self._msg_roles: dict[str, str] = {}
 
@@ -429,7 +431,14 @@ class _EventCollector:
         pass
 
     def _handle_message_updated(self, props: dict) -> None:
-        """Track cost/tokens and cache message roles."""
+        """Track cost/tokens and cache message roles.
+
+        opencode emits multiple message.updated events per assistant turn
+        (one per internal API call).  Each carries that call's cost/tokens,
+        NOT a running total.  We therefore *accumulate* across events.
+        Duplicate events (same cost) for the same API call are deduplicated
+        by tracking the last-seen cost per message.
+        """
         info = props.get("info", {})
         if info.get("sessionID") != self._session_id:
             return
@@ -441,10 +450,24 @@ class _EventCollector:
             return
         cost = info.get("cost", 0)
         tokens = info.get("tokens", {})
-        if cost:
-            self._total_cost = cost
-        if tokens:
-            self._total_tokens = tokens
+
+        # Deduplicate: opencode sends the same event twice (before/after
+        # parts update). Skip if cost hasn't changed for this message.
+        last_cost = self._last_msg_cost.get(msg_id, 0)
+        if cost and cost != last_cost:
+            self._total_cost += cost
+            self._last_msg_cost[msg_id] = cost
+            # Accumulate token counts
+            if tokens:
+                for k, v in tokens.items():
+                    if isinstance(v, (int, float)):
+                        self._total_tokens[k] = self._total_tokens.get(k, 0) + v
+                    elif isinstance(v, dict):
+                        if k not in self._total_tokens:
+                            self._total_tokens[k] = {}
+                        for sk, sv in v.items():
+                            if isinstance(sv, (int, float)):
+                                self._total_tokens[k][sk] = self._total_tokens[k].get(sk, 0) + sv
 
     def _get_msg_role(self, msg_id: str) -> str:
         """Determine message role from cached info."""
