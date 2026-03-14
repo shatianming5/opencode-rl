@@ -481,20 +481,26 @@ def run_pipeline(
     total_cost = 0.0
     total_tokens: dict[str, int] = {}
     iter_summaries = []
+    def _merge_tokens(dest: dict, src: dict) -> None:
+        for k, v in src.items():
+            if isinstance(v, (int, float)):
+                dest[k] = dest.get(k, 0) + int(v)
+            elif isinstance(v, dict):
+                if k not in dest:
+                    dest[k] = {}
+                _merge_tokens(dest[k], v)
+
     for it in state.iterations:
         iter_cost = 0.0
-        iter_tokens: dict[str, int] = {}
+        iter_tokens: dict = {}
         for phase_name, pr in it.phase_results.items():
             payload = pr.get("payload", {}) if isinstance(pr, dict) else {}
             if "agent_cost" in payload:
                 iter_cost += payload["agent_cost"]
             if "agent_tokens" in payload:
-                for k, v in payload["agent_tokens"].items():
-                    if isinstance(v, (int, float)):
-                        iter_tokens[k] = iter_tokens.get(k, 0) + int(v)
+                _merge_tokens(iter_tokens, payload["agent_tokens"])
         total_cost += iter_cost
-        for k, v in iter_tokens.items():
-            total_tokens[k] = total_tokens.get(k, 0) + v
+        _merge_tokens(total_tokens, iter_tokens)
         entry: dict = {
             "iteration": it.iteration,
             "exit_code": it.exit_code,
