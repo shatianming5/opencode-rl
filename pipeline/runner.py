@@ -477,23 +477,49 @@ def run_pipeline(
     print_pipeline_footer(best_score, best_iteration,
                           len(state.iterations), total_time)
 
-    summary = {
+    # Aggregate token/cost from phase_results
+    total_cost = 0.0
+    total_tokens: dict[str, int] = {}
+    iter_summaries = []
+    for it in state.iterations:
+        iter_cost = 0.0
+        iter_tokens: dict[str, int] = {}
+        for phase_name, pr in it.phase_results.items():
+            payload = pr.get("payload", {}) if isinstance(pr, dict) else {}
+            if "agent_cost" in payload:
+                iter_cost += payload["agent_cost"]
+            if "agent_tokens" in payload:
+                for k, v in payload["agent_tokens"].items():
+                    if isinstance(v, (int, float)):
+                        iter_tokens[k] = iter_tokens.get(k, 0) + int(v)
+        total_cost += iter_cost
+        for k, v in iter_tokens.items():
+            total_tokens[k] = total_tokens.get(k, 0) + v
+        entry: dict = {
+            "iteration": it.iteration,
+            "exit_code": it.exit_code,
+            "training_time": it.training_time,
+            "score": it.score,
+            "improvement": it.improvement,
+        }
+        if iter_cost:
+            entry["agent_cost"] = round(iter_cost, 6)
+        if iter_tokens:
+            entry["agent_tokens"] = iter_tokens
+        iter_summaries.append(entry)
+
+    summary: dict = {
         "task": task,
         "base_model": base_model,
         "best_score": best_score,
         "best_iteration": best_iteration,
         "total_time": total_time,
-        "iterations": [
-            {
-                "iteration": it.iteration,
-                "exit_code": it.exit_code,
-                "training_time": it.training_time,
-                "score": it.score,
-                "improvement": it.improvement,
-            }
-            for it in state.iterations
-        ],
+        "iterations": iter_summaries,
     }
+    if total_cost:
+        summary["total_agent_cost"] = round(total_cost, 6)
+    if total_tokens:
+        summary["total_agent_tokens"] = total_tokens
     summary_path = Path(workspace) / "pipeline_results.json"
     summary_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False))
     console.print(f"  [dim]Results saved:[/] {summary_path}")
