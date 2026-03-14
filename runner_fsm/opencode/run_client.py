@@ -221,6 +221,8 @@ class _EventCollector:
             assistant_text="\n".join(self._assistant_texts),
             tool_trace=self._trace,
             error=self._error,
+            total_cost=self._total_cost,
+            total_tokens=dict(self._total_tokens),
         )
 
     def _safe_callback(self, event: TurnEvent) -> None:

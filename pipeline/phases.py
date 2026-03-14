@@ -61,11 +61,16 @@ def _save_agent_log(
     result: "AgentResult | None",
     error_msg: str = "",
 ) -> None:
-    """Save agent log: assistant text + tool trace + any error."""
+    """Save agent log: assistant text + tool trace + token usage + any error."""
     log_parts: list[str] = []
     if error_msg:
         log_parts.append(f"[ERROR] {error_msg}")
     if result:
+        if result.total_tokens or result.total_cost:
+            log_parts.append(f"\n--- Token Usage ---")
+            log_parts.append(f"Cost: ${result.total_cost:.4f}")
+            for k, v in result.total_tokens.items():
+                log_parts.append(f"  {k}: {v}")
         if result.assistant_text:
             log_parts.append(result.assistant_text[-20000:])
         if result.tool_trace:
@@ -79,6 +84,16 @@ def _save_agent_log(
         (log_dir / f"{purpose}_iter{iteration}_result.txt").write_text(
             "\n".join(log_parts), encoding="utf-8",
         )
+
+
+def _token_payload(result: "AgentResult") -> dict:
+    """Extract token/cost info from AgentResult as a dict for PhaseResult payload."""
+    d: dict = {}
+    if result.total_cost:
+        d["agent_cost"] = result.total_cost
+    if result.total_tokens:
+        d["agent_tokens"] = result.total_tokens
+    return d
 
 
 def _run_agent(
@@ -110,16 +125,23 @@ def _run_agent(
         except Exception:
             pass
 
+    # Print token summary
+    if result.total_cost or result.total_tokens:
+        in_tok = result.total_tokens.get("input", 0)
+        out_tok = result.total_tokens.get("output", 0)
+        console.print(f"  [dim]Tokens:[/] in={in_tok:,} out={out_tok:,}  [dim]Cost:[/] ${result.total_cost:.4f}")
+
     # Agent returned — check for error (e.g. timeout with partial data)
     if result.error:
         _save_agent_log(log_dir, purpose, iteration, result, result.error)
         return PhaseResult(
             success=False, phase=phase_name,
             error=f"Agent error: {result.error}",
+            payload=_token_payload(result),
         )
 
     _save_agent_log(log_dir, purpose, iteration, result)
-    return result.assistant_text or ""
+    return result
 
 
 def _cap_stdout(collected: list[str]) -> str:
@@ -185,13 +207,14 @@ def phase_code_generation(
     if isinstance(out, PhaseResult):
         return out
 
+    tok = _token_payload(out)
     code_path = Path(workspace) / "code" / "train.py"
     if code_path.exists():
         console.print(f"  [green]Code generated:[/] {code_path} [dim]({code_path.stat().st_size} bytes)[/]")
-        return PhaseResult(success=True, phase="code_gen", payload={"code_path": str(code_path)})
+        return PhaseResult(success=True, phase="code_gen", payload={"code_path": str(code_path), **tok})
     console.print(f"  [bold yellow]WARNING:[/] {code_path} not found after agent finished")
     return PhaseResult(success=False, phase="code_gen", error=f"{code_path} not found",
-                       payload={"code_path": str(code_path)})
+                       payload={"code_path": str(code_path), **tok})
 
 
 def phase_training(
@@ -403,7 +426,7 @@ def phase_fix_training(
                      "fix_training", "FixTraining", "fix_training")
     if isinstance(out, PhaseResult):
         return out
-    return PhaseResult(success=True, phase="fix_training")
+    return PhaseResult(success=True, phase="fix_training", payload=_token_payload(out))
 
 
 def phase_analysis(
@@ -444,4 +467,5 @@ def phase_analysis(
     else:
         console.print(f"  [bold yellow]WARNING:[/] analysis.md not found after agent finished")
 
-    return PhaseResult(success=True, phase="analysis", payload={"analysis": analysis_text})
+    tok = _token_payload(out)
+    return PhaseResult(success=True, phase="analysis", payload={"analysis": analysis_text, **tok})
